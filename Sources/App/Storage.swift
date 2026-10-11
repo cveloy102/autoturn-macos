@@ -29,16 +29,18 @@ enum Storage {
         guard getnameinfo(first.pointee.ai_addr, first.pointee.ai_addrlen, &buffer, socklen_t(buffer.count), nil, 0, NI_NUMERICHOST) == 0 else { throw AppError.message("IP сервера недоступен") }
         return String(cString: buffer)
     }
-    static func setLaunchAtLogin(_ enabled: Bool) throws {
-        let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/LaunchAgents")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let file = dir.appendingPathComponent("ru.hl100.autoturn.login.plist")
-        if enabled {
-            guard let executable = Bundle.main.executableURL?.path else { throw AppError.message("Нет пути приложения") }
-            let plist: [String:Any] = ["Label":"ru.hl100.autoturn.login", "ProgramArguments":[executable,"--background"], "RunAtLoad":true, "ProcessType":"Interactive"]
-            try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0).write(to: file, options: .atomic)
-        } else if FileManager.default.fileExists(atPath: file.path) { try FileManager.default.removeItem(at: file) }
+    static var loginDirectory:URL { FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/LaunchAgents") }
+    static func setLaunchAtLogin(_ enabled:Bool) throws { try LoginRegistration.set(enabled,in:loginDirectory) }
+    static func restoreLaunchAtLogin(_ settings:inout Settings) throws {
+        // An existing valid registration records the user's prior choice. Explicit Off removes it.
+        let enabled = settings.launchAtLogin || LoginRegistration.existing(in:loginDirectory)
+        try setLaunchAtLogin(enabled)
+        if enabled != settings.launchAtLogin {
+            settings.launchAtLogin = enabled
+            try save(settings)
+        }
     }
+
 }
 
 final class ServiceClient {

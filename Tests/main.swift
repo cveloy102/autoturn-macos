@@ -122,4 +122,23 @@ archiveRelease.signature = try signingKey.signature(for:archiveData).base64Encod
 try Updater.validateArchive(archiveData,release:archiveRelease,publicKey:signingKey.publicKey.rawRepresentation); passed += 1
 do { try Updater.validateArchive(Data("altered archive".utf8),release:archiveRelease,publicKey:signingKey.publicKey.rawRepresentation); fatalError("Altered archive accepted") } catch { passed += 1 }
 do { try Updater.validateArchive(archiveData,release:archiveRelease,publicKey:Curve25519.Signing.PrivateKey().publicKey.rawRepresentation); fatalError("Wrong archive signer accepted") } catch { passed += 1 }
+let loginTestDirectory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+defer { try? FileManager.default.removeItem(at:loginTestDirectory) }
+expect(!LoginRegistration.existing(in:loginTestDirectory),"missing login agent enabled")
+try LoginRegistration.set(true,in:loginTestDirectory)
+expect(LoginRegistration.existing(in:loginTestDirectory),"login choice not registered")
+let loginFile = loginTestDirectory.appendingPathComponent(LoginRegistration.label + ".plist")
+let registered = try PropertyListSerialization.propertyList(from:Data(contentsOf:loginFile),format:nil) as! [String:Any]
+expect(registered["ProgramArguments"] as? [String] == ["/usr/bin/open","-g","-a","/Applications/AutoTurn.app","--args","--background"],"login did not launch app through LaunchServices")
+try LoginRegistration.set(true,in:loginTestDirectory)
+expect(LoginRegistration.existing(in:loginTestDirectory),"repeated registration lost preference")
+let legacy:[String:Any] = ["Label":LoginRegistration.label,"ProgramArguments":["/Applications/AutoTurn.app/Contents/MacOS/AutoTurn","--background"],"RunAtLoad":true]
+try PropertyListSerialization.data(fromPropertyList:legacy,format:.xml,options:0).write(to:loginFile)
+expect(LoginRegistration.existing(in:loginTestDirectory),"previous login registration not migrated")
+try LoginRegistration.set(true,in:loginTestDirectory)
+expect(LoginRegistration.existing(in:loginTestDirectory),"migration lost registration")
+try LoginRegistration.set(false,in:loginTestDirectory)
+expect(!LoginRegistration.existing(in:loginTestDirectory),"explicit login Off was undone")
+try LoginRegistration.set(false,in:loginTestDirectory)
+expect(!FileManager.default.fileExists(atPath:loginFile.path),"login Off is not idempotent")
 print("\(passed) checks passed: AWG 3.1 parser, full tunnel, home policy, failover order, retries, update signatures, downgrade/host/OS rejection")

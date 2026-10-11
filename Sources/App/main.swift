@@ -158,6 +158,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
     var serviceAvailable = false, busy = false, checkingUpdate = false, polling = false
     var window: NSWindow!, body = NSView(), page = NSStackView(), footer: NSTextField!
     var tab = "Соединение"
+    weak var pendingHomeField: NSTextField?
+    var homeNetworkLabel:NSTextField?
     var navigation: NSStackView?
     var statusItem: NSStatusItem!, popover = NSPopover()
     var localClickMonitor: Any?, globalClickMonitor: Any?, resignObserver: NSObjectProtocol?
@@ -174,10 +176,14 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
     let preview = CommandLine.arguments.contains("--render-preview") || CommandLine.arguments.contains("--ui-self-check")
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
-        if !preview { do { settings = try Storage.load() } catch { showError(error) } }
+        if !preview {
+            do { settings = try Storage.load() }
+            catch { showError(error); NSApp.terminate(nil); return }
+            do { try Storage.restoreLaunchAtLogin(&settings) } catch { showError(error) }
+        }
         buildWindow(); buildStatusItem()
         if CommandLine.arguments.contains("--ui-self-check") { checkInterface(); return }; if preview { renderPreview(); return }
-        observer.changed = { [weak self] network in guard let self = self, self.serviceAvailable else { return }; self.client.send(RPCRequest(command:"network",settings:nil,network:network)) { self.accept($0,quiet:true) } }
+        observer.changed = { [weak self] network in guard let self = self else { return }; self.updateHomeNetwork(network); guard self.serviceAvailable else { return }; self.client.send(RPCRequest(command:"network",settings:nil,network:network)) { self.accept($0,quiet:true) } }
         NSWorkspace.shared.notificationCenter.addObserver(self,selector:#selector(woke),name:NSWorkspace.didWakeNotification,object:nil)
         refresh()
         timer = Timer(timeInterval:1,repeats:true) { [weak self] _ in
@@ -290,15 +296,33 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
     func homePage() {
         page.addArrangedSubview(label("[ 03 / TRUSTED NETWORKS ]",size:11,color:Palette.red)); page.addArrangedSubview(heading("Дома — без VPN_")); page.addArrangedSubview(label("Маршруты уже настроены на роутере.",color:Palette.dim))
         let current = observer.snapshot()
-        page.addArrangedSubview(label("Текущий Wi-Fi: \(current.ssid ?? "название недоступно")"))
-        page.addArrangedSubview(ActionButton("Разрешить определение домашнего Wi-Fi…") { [weak self] in self?.observer.requestPermission() })
+        homeNetworkLabel = label("Текущий Wi-Fi: \(current.ssid ?? "название недоступно")"); page.addArrangedSubview(homeNetworkLabel!)
+        page.addArrangedSubview(ActionButton("Открыть настройки геолокации…") { [weak self] in self?.observer.requestPermission() })
         let field = NSTextField(string:settings.homeSSIDs.joined(separator:"\n")); field.font = NSFont.monospacedSystemFont(ofSize:13,weight:.regular); field.textColor = Palette.ink; field.backgroundColor = Palette.panel; field.placeholderString = "Home_5G, Home_2G"; field.heightAnchor.constraint(equalToConstant:65).isActive = true; page.addArrangedSubview(field)
         let row = stack(vertical:false)
-        row.addArrangedSubview(ActionButton("Добавить текущую") { [weak self] in guard let ssid = self?.observer.snapshot().ssid else { self?.showError(AppError.message("Разреши геолокацию для чтения SSID")); return }; var homes = field.stringValue.components(separatedBy:CharacterSet(charactersIn:",\n")).map { $0.trimmingCharacters(in:.whitespaces) }.filter { !$0.isEmpty }; if !homes.contains(ssid) { homes.append(ssid) }; field.stringValue = homes.joined(separator:", ") })
+        row.addArrangedSubview(ActionButton("Добавить текущую") { [weak self, weak field] in
+            guard let self = self, let field = field else { return }
+            guard let ssid = self.observer.snapshot().ssid else {
+                self.pendingHomeField = field; self.observer.requestPermission(); return
+            }
+            self.addHomeSSID(ssid,to:field)
+        })
         row.addArrangedSubview(ActionButton("Сохранить сети",primary:true) { [weak self] in guard let self = self else { return }; let homes = field.stringValue.components(separatedBy:CharacterSet(charactersIn:",\n")).map { $0.trimmingCharacters(in:.whitespaces) }.filter { !$0.isEmpty }; guard homes.count <= 32, homes.allSatisfy({$0.utf8.count <= 32}) else { self.showError(AppError.message("Слишком длинное название сети")); return }; self.settings.homeSSIDs = Array(NSOrderedSet(array:homes)) as? [String] ?? homes; self.persistAndConfigure() })
         row.addArrangedSubview(NSView()); page.addArrangedSubview(row)
         let login = NSButton(checkboxWithTitle:"Запускать AutoTurn при входе",target:self,action:#selector(toggleLogin(_:))); login.state = settings.launchAtLogin ? .on : .off; page.addArrangedSubview(login)
-        page.addArrangedSubview(label("Если SSID недоступен или интернет идёт через Ethernet, считаем сеть внешней. Название Wi-Fi само по себе не подтверждает подлинность сети.",size:11,color:Palette.dim))
+        page.addArrangedSubview(label("В настройках геолокации включи службы геолокации и разреши AutoTurn. После разрешения текущая сеть появится здесь; нажми «Сохранить сети». Ethernet считаем внешней сетью.",size:11,color:Palette.dim))
+    }
+    func addHomeSSID(_ ssid:String,to field:NSTextField) {
+        var homes = field.stringValue.components(separatedBy:CharacterSet(charactersIn:",\n")).map { $0.trimmingCharacters(in:.whitespaces) }.filter { !$0.isEmpty }
+        if !homes.contains(ssid) { homes.append(ssid) }
+        field.stringValue = homes.joined(separator:", ")
+    }
+    func updateHomeNetwork(_ network:NetworkObservation) {
+        guard tab == "Домашняя сеть" else { pendingHomeField = nil; return }
+        homeNetworkLabel?.stringValue = "Текущий Wi-Fi: \(network.ssid ?? "название недоступно")"
+        if let field = pendingHomeField, field.window === window, let ssid = network.ssid {
+            addHomeSSID(ssid,to:field); pendingHomeField = nil
+        }
     }
     func eventsPage() {
         page.addArrangedSubview(label("[ 04 / EVENT LOG ]",size:11,color:Palette.red))
@@ -332,7 +356,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         let brand = label("AUTOTURN_",size:18)
         let word = NSMutableAttributedString(string:"AUTOTURN",attributes:[.font:brand.font!,.foregroundColor:Palette.ink])
         word.append(NSAttributedString(string:"_",attributes:[.font:brand.font!,.foregroundColor:Palette.red])); brand.attributedStringValue = word
-        place(brand,24,16,195); place(label("HL100",size:11,color:Palette.dim),18,241,35)
+        place(brand,24,16,195); place(label("HL100",size:11,color:Palette.dim),18,232,44)
         y += 37; place(line(),1); y += 17
         let dot = NSView(); fill(dot,color:status.phase == .connected ? Palette.green : status.phase == .error || status.phase == .recovering ? Palette.red : status.phase == .connecting || status.phase == .waiting ? NSColor.systemOrange : Palette.dim)
         place(dot,7,16,7); dot.frame.origin.y += 5
@@ -455,7 +479,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         client.send(request) { [weak self] result in
             guard let self = self else { return }
             self.accept(result); self.observer.report()
-            do { try Storage.save(snapshot) } catch { self.info("Режим применён к службе, но настройки не сохранены: " + error.localizedDescription) }
+            do { try Storage.save(self.settings) } catch { self.info("Режим применён к службе, но настройки не сохранены: " + error.localizedDescription) }
             self.busy = false
         }
     }
@@ -657,7 +681,16 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
             }
             func checkCredits(_ view:NSView) { if let field = view as? NSTextField, field.stringValue.contains("LENCHA_") { let frame = field.convert(field.bounds,to:menu); require(frame.width > 40 && frame.maxX <= menu.bounds.width && frame.minX >= 0 && frame.minY >= 0,"clipped menu credit") }; view.subviews.forEach { checkCredits($0) } }
             checkCredits(menu)
+            let mark = menu.subviews.compactMap { $0 as? NSTextField }.first { $0.stringValue == "HL100" }
+            require(mark != nil && mark!.frame.width >= mark!.intrinsicContentSize.width,"HL100 label clipped")
         }
+        tab = "Домашняя сеть"; buildPage(); window.contentView?.layoutSubtreeIfNeeded()
+        let homeField = page.arrangedSubviews.compactMap { $0 as? NSTextField }.first { $0.placeholderString != nil }!
+        homeField.stringValue = "ExistingHome"; pendingHomeField = homeField
+        updateHomeNetwork(NetworkObservation(available:true,interface:"en0",ssid:"SecondHome",gateway:"192.0.2.1"))
+        require(homeField.stringValue == "ExistingHome, SecondHome" && pendingHomeField == nil,"home network not filled after permission")
+        addHomeSSID("SecondHome",to:homeField); require(homeField.stringValue == "ExistingHome, SecondHome","duplicate home network")
+        require(homeNetworkLabel?.stringValue == "Текущий Wi-Fi: SecondHome","home label not updated live")
         let pasteboard = NSPasteboard.withUniqueName(); defer { pasteboard.releaseGlobally() }
         pasteboard.writeObjects([URL(fileURLWithPath:"/tmp/test.conf") as NSURL,URL(fileURLWithPath:"/tmp/unrelated.txt") as NSURL])
         let surface = window.contentView as! ConsoleSurface

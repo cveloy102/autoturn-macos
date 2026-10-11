@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import CoreWLAN
 import CoreLocation
 import SystemConfiguration
@@ -10,7 +11,15 @@ final class NetworkObserver: NSObject, CLLocationManagerDelegate {
     private var timer: Timer?
     var changed: ((NetworkObservation) -> Void)?
     override init() { super.init(); location.delegate = self; monitor.pathUpdateHandler = { [weak self] _ in DispatchQueue.main.async { self?.report() } }; monitor.start(queue: DispatchQueue(label: "ru.hl100.autoturn.network")); timer = Timer(timeInterval: 3, repeats: true) { [weak self] _ in self?.report() }; RunLoop.main.add(timer!,forMode:.common) }
-    func requestPermission() { location.requestAlwaysAuthorization(); report() }
+    static let locationSettingsURL = URL(string:"x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_LocationServices")!
+    func requestPermission() {
+        if location.authorizationStatus == .notDetermined { location.requestAlwaysAuthorization() }
+        // Re-requesting a denied permission does not show another system prompt.
+        if !NSWorkspace.shared.open(Self.locationSettingsURL) {
+            NSWorkspace.shared.open(URL(string:"x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension")!)
+        }
+        report()
+    }
     func locationManager(_ manager: CLLocationManager, didChangeAuthorization status: CLAuthorizationStatus) { report() }
     func report() { changed?(snapshot()) }
     func snapshot() -> NetworkObservation {
