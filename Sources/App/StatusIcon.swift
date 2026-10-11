@@ -1,7 +1,7 @@
 import AppKit
 
 // Template artwork keeps the same stroke weight in light and dark menu bars.
-enum StatusIcon: CaseIterable {
+enum StatusIcon: CaseIterable, Hashable {
     case home, connected, connecting, error, off, unknown
     static func state(_ phase: Phase, missingLocation: Bool) -> StatusIcon {
         if missingLocation { return .unknown }
@@ -14,7 +14,9 @@ enum StatusIcon: CaseIterable {
         case .setup: return .unknown
         }
     }
-    var image: NSImage {
+    private static let images: [StatusIcon:NSImage] = Dictionary(uniqueKeysWithValues:allCases.map { ($0,$0.makeImage()) })
+    var image:NSImage { Self.images[self]! }
+    private func makeImage() -> NSImage {
         let icon = self
         let image = NSImage(size: NSSize(width:18,height:18), flipped:true) { _ in
             NSGraphicsContext.saveGraphicsState()

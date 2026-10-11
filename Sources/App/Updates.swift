@@ -25,12 +25,20 @@ final class Updater {
     var candidate: MacRelease?
     var archive: URL?
     private var publicKey: Data? { (Bundle.main.object(forInfoDictionaryKey: "ATUpdatePublicKey") as? String).flatMap { Data(base64Encoded: $0) }.flatMap { $0.count == 32 ? $0 : nil } }
+    // Persist only the signed public release envelope, never profiles or VPN keys.
+    // Validate again against this installed build before restoring the indicator.
+    func restoreCandidate() {
+        guard let key = publicKey, let data = UserDefaults.standard.data(forKey:"updates.signedCandidate"), data.count <= 128*1024 else { return }
+        let build = Int(Bundle.main.object(forInfoDictionaryKey:"CFBundleVersion") as? String ?? "0") ?? 0
+        candidate = try? Self.validateMetadata(data,publicKey:key,installedBuild:build)
+        if candidate == nil { UserDefaults.standard.removeObject(forKey:"updates.signedCandidate") }
+    }
     func check(installedBuildOverride:Int? = nil, completion: @escaping (Result<MacRelease?, Error>) -> Void) {
         guard let publicKey = publicKey else { completion(.failure(AppError.message("Обновления подготовлены, но ключ подписи релизов ещё не настроен. Сейчас доступна только эта тестовая сборка."))); return }
         session.dataTask(with: URL(string:feed)!) { data, response, error in
             guard error == nil, (response as? HTTPURLResponse)?.statusCode == 200, let data = data, data.count <= 4*1024*1024, let releases = (try? JSONSerialization.jsonObject(with:data)) as? [[String:Any]] else { DispatchQueue.main.async { completion(.failure(AppError.message("Не удалось проверить GitHub. Повтори позже."))) }; return }
             let release = releases.first { item in (item["draft"] as? Bool) == false && (item["prerelease"] as? Bool) == false && (item["tag_name"] as? String)?.hasPrefix("macos-v") == true }
-            guard let item = release, let assets = item["assets"] as? [[String:Any]], let asset = assets.first(where: { $0["name"] as? String == "macos-update.json" }), let address = asset["browser_download_url"] as? String, let url = URL(string:address), url.scheme == "https", url.host == "github.com", url.path.hasPrefix("/cveloy102/autoturn-macos/releases/download/macos-v") else { DispatchQueue.main.async { completion(.success(nil)) }; return }
+            guard let item = release, let assets = item["assets"] as? [[String:Any]], let asset = assets.first(where: { $0["name"] as? String == "macos-update.json" }), let address = asset["browser_download_url"] as? String, let url = URL(string:address), url.scheme == "https", url.host == "github.com", url.path.hasPrefix("/cveloy102/autoturn-macos/releases/download/macos-v") else { DispatchQueue.main.async { self.candidate = nil; UserDefaults.standard.removeObject(forKey:"updates.signedCandidate"); completion(.success(nil)) }; return }
             self.checkMetadata(url: url, publicKey:publicKey, installedBuildOverride:installedBuildOverride, completion:completion)
         }.resume()
     }
@@ -42,7 +50,14 @@ final class Updater {
                 let installedBuild = installedBuildOverride ?? (Int(Bundle.main.object(forInfoDictionaryKey:"CFBundleVersion") as? String ?? "0") ?? 0)
                 return try Self.validateMetadata(data, publicKey:publicKey, installedBuild:installedBuild)
             }
-            DispatchQueue.main.async { if case .success(let release) = result { self.candidate = release }; completion(result) }
+            DispatchQueue.main.async {
+                if case .success(let release) = result {
+                    self.candidate = release
+                    if release != nil, let data = data { UserDefaults.standard.set(data,forKey:"updates.signedCandidate") }
+                    else { UserDefaults.standard.removeObject(forKey:"updates.signedCandidate") }
+                }
+                completion(result)
+            }
         }; task.resume()
     }
     static func validateMetadata(_ data: Data, publicKey: Data, installedBuild: Int) throws -> MacRelease? {

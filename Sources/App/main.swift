@@ -29,6 +29,8 @@ final class ActionButton: NSButton {
     var tabStyle = false
     var rowStyle = false
     var menuStyle = false
+    var cornerRadius: CGFloat = 0
+    var creamPrimary = false
     var menuIcon: String?
     var profileSubtitle: String?
     var profileState: String?
@@ -54,8 +56,9 @@ final class ActionButton: NSButton {
         } else if menuStyle {
             Palette.bg.setFill(); rect.fill()
         } else {
-            (primary ? Palette.red : Palette.panel).setFill(); rect.fill()
-            (primary ? Palette.red : Palette.line).setStroke(); NSBezierPath(rect:rect).stroke()
+            (primary ? (creamPrimary ? Palette.ink : Palette.red) : Palette.panel).setFill()
+            let shape = NSBezierPath(roundedRect:rect,xRadius:cornerRadius,yRadius:cornerRadius); shape.fill()
+            (primary ? (creamPrimary ? Palette.ink : Palette.red) : Palette.line).setStroke(); shape.stroke()
         }
         let textColor = !isEnabled ? Palette.dim : rowStyle || menuStyle ? Palette.ink : tabStyle ? (primary ? Palette.ink : Palette.dim) : primary ? Palette.bg : Palette.ink
         let attributes: [NSAttributedString.Key:Any] = [.font:font!, .foregroundColor:textColor]
@@ -98,7 +101,7 @@ final class StackScroll: NSScrollView {
     init(_ items:NSStackView) {
         self.items = items
         super.init(frame:.zero)
-        hasVerticalScroller = true; drawsBackground = false; borderType = .noBorder
+        hasVerticalScroller = true; scrollsDynamically = true; usesPredominantAxisScrolling = true; drawsBackground = false; borderType = .noBorder
         let document = FlippedDocument(frame:.zero); documentView = document
         items.translatesAutoresizingMaskIntoConstraints = true; document.addSubview(items)
     }
@@ -122,6 +125,7 @@ func paintHeading(_ field:NSTextField,_ text:String) {
 }
 final class ConsoleSurface: NSView {
     let header = NSView(), navigation = NSView(), content = NSView(), bottom = NSView()
+    var sidebarAppearance = false
     var dropped: (([URL]) -> Void)?
     override var isFlipped: Bool { true }
     override init(frame:NSRect) {
@@ -135,13 +139,20 @@ final class ConsoleSurface: NSView {
     override func layout() {
         super.layout()
         header.frame = NSRect(x:24,y:0,width:bounds.width-48,height:90)
-        navigation.frame = NSRect(x:24,y:90,width:bounds.width-48,height:48)
-        content.frame = NSRect(x:24,y:162,width:bounds.width-48,height:max(400,bounds.height-232))
+        if sidebarAppearance {
+            navigation.frame = NSRect(x:18,y:110,width:158,height:bounds.height-170)
+            content.frame = NSRect(x:204,y:112,width:bounds.width-228,height:max(400,bounds.height-182))
+        } else {
+            navigation.frame = NSRect(x:24,y:90,width:bounds.width-48,height:48)
+            content.frame = NSRect(x:24,y:162,width:bounds.width-48,height:max(400,bounds.height-232))
+        }
         bottom.frame = NSRect(x:24,y:bounds.height-46,width:bounds.width-48,height:46)
     }
     override func draw(_ dirtyRect:NSRect) {
         Palette.line.setFill()
-        for y in [CGFloat(90),138,bounds.height-46] { NSRect(x:0,y:y,width:bounds.width,height:1).fill() }
+        for y in [CGFloat(90),bounds.height-46] { NSRect(x:0,y:y,width:bounds.width,height:1).fill() }
+        if sidebarAppearance { NSRect(x:186,y:90,width:1,height:bounds.height-136).fill() }
+        else { NSRect(x:0,y:138,width:bounds.width,height:1).fill() }
     }
     func files(_ sender:NSDraggingInfo) -> [URL] { files(sender.draggingPasteboard) }
     func files(_ pasteboard:NSPasteboard) -> [URL] {
@@ -153,22 +164,30 @@ final class ConsoleSurface: NSView {
     override func performDragOperation(_ sender:NSDraggingInfo) -> Bool { let urls = files(sender); guard !urls.isEmpty else { return false }; dropped?(urls); return true }
 }
 
-final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopoverDelegate, UNUserNotificationCenterDelegate {
+final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNotificationCenterDelegate {
     var settings = Settings(), status = ServiceStatus()
     var serviceAvailable = false, busy = false, checkingUpdate = false, polling = false
     var window: NSWindow!, body = NSView(), page = NSStackView(), footer: NSTextField!
     var tab = "Соединение"
+    var testConsoleAppearance: ConsoleAppearance?
+    var consoleAppearance: ConsoleAppearance { testConsoleAppearance ?? ConsoleAppearance(rawValue:UserDefaults.standard.string(forKey:"appearance.console") ?? "") ?? .console }
+    var testMenuAppearance: MenuAppearance?
+    var menuAppearance: MenuAppearance { testMenuAppearance ?? MenuAppearance(rawValue:UserDefaults.standard.string(forKey:"appearance.menu") ?? "") ?? .instrument }
     weak var pendingHomeField: NSTextField?
     var homeNetworkLabel:NSTextField?
     var navigation: NSStackView?
-    var statusItem: NSStatusItem!, popover = NSPopover()
+    var statusItem: NSStatusItem!, popover = StableMenuPanel()
     var localClickMonitor: Any?, globalClickMonitor: Any?, resignObserver: NSObjectProtocol?
-    var renderedMenuRevision = "", observedRevision = ""
+    var renderedMenuRevision = "", observedRevision = "", renderedStatusRevision = ""
     var lastStatusRefresh = Date.distantPast
     let observeLiveNetwork = CommandLine.arguments.contains("--observe-live-network")
     let client = ServiceClient(), observer = NetworkObserver(), updater = Updater()
     let updateHistory = UpdateHistory()
     var updateTimer: Timer?
+    var consoleProfileButtons: [(Profile,ActionButton)] = []
+    var consoleEventsField:NSTextField?
+    var connectionCheckField:NSTextField?
+    var notifyingVersions = Set<String>()
     var timer: Timer?, connectionTitle: NSTextField?, connectionMessage: NSTextField?, connectionNetwork: NSTextField?, connectionProfile: NSTextField?, connectionGuard: NSTextField?
     let liveNetworkTest = CommandLine.arguments.contains("--live-network-test")
     var testExitCode: Int32 = 0
@@ -181,6 +200,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
             do { settings = try Storage.load() }
             catch { showError(error); NSApp.terminate(nil); return }
             do { try Storage.restoreLaunchAtLogin(&settings) } catch { showError(error) }
+            updater.restoreCandidate()
         }
         buildWindow(); buildStatusItem()
         if CommandLine.arguments.contains("--ui-self-check") { checkInterface(); return }; if preview { renderPreview(); return }
@@ -202,11 +222,11 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         window.title = "AutoTurn / Пульт"; window.contentMinSize = NSSize(width:700,height:700); window.delegate = self; window.isReleasedWhenClosed = false; window.appearance = NSAppearance(named:.darkAqua); window.backgroundColor = Palette.bg
         let container = ConsoleSurface(frame:NSRect(x:0,y:0,width:760,height:700)); window.contentView = container
         container.dropped = { [weak self] files in self?.importProfiles(files) }
-        let mark = PixelMark(frame:.zero); mark.translatesAutoresizingMaskIntoConstraints = false
-        mark.widthAnchor.constraint(equalToConstant:25).isActive = true; mark.heightAnchor.constraint(equalToConstant:25).isActive = true
+        let mark = NSImageView(frame:.zero); mark.image = ApplicationArtwork.icon; mark.imageScaling = .scaleProportionallyUpOrDown; mark.translatesAutoresizingMaskIntoConstraints = false
+        mark.widthAnchor.constraint(equalToConstant:33).isActive = true; mark.heightAnchor.constraint(equalToConstant:33).isActive = true
         let word = label("AUTOTURN_",size:23)
-        let wordText = NSMutableAttributedString(string:"AUTO",attributes:[.font:NSFont.monospacedSystemFont(ofSize:23,weight:.medium),.foregroundColor:Palette.ink])
-        wordText.append(NSAttributedString(string:"TURN_",attributes:[.font:NSFont.monospacedSystemFont(ofSize:23,weight:.medium),.foregroundColor:Palette.red])); word.attributedStringValue = wordText
+        let wordText = NSMutableAttributedString(string:"AUTOTURN",attributes:[.font:NSFont.monospacedSystemFont(ofSize:20,weight:.medium),.foregroundColor:Palette.ink])
+        wordText.append(NSAttributedString(string:"_",attributes:[.font:NSFont.monospacedSystemFont(ofSize:20,weight:.medium),.foregroundColor:Palette.red])); word.attributedStringValue = wordText
         let identity = stack([word,label("HL100 / VPN CLIENT",size:11,color:Palette.dim)],spacing:4)
         let spacer = NSView(); spacer.setContentHuggingPriority(.init(1),for:.horizontal)
         let edition = label("AMNEZIAWG 3.1\nINTEL + APPLE SILICON",size:11,color:Palette.dim); edition.alignment = .right
@@ -220,53 +240,107 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
     }
     func buildNavigation() {
         guard let nav = navigation else { return }
+        let sidebar = consoleAppearance == .workspace
+        (window.contentView as? ConsoleSurface)?.sidebarAppearance = sidebar
+        window.contentView?.needsLayout = true
+        nav.orientation = sidebar ? .vertical : .horizontal
+        nav.alignment = sidebar ? .leading : .centerY
         nav.arrangedSubviews.forEach { nav.removeArrangedSubview($0); $0.removeFromSuperview() }
-        for name in ["Соединение","Профили","Домашняя сеть","События"] {
-            let button = ActionButton(name == "Профили" ? "Профили \(settings.profiles.count)" : name,primary:tab == name) { [weak self] in self?.tab = name; self?.buildPage() }
-            button.tabStyle = true; nav.addArrangedSubview(button)
+        for name in ["Соединение","Профили","Домашняя сеть","События","Настройки"] {
+            let button = ActionButton(name == "Профили" ? "Профили \(settings.profiles.count)" : name == "Домашняя сеть" ? "Дом" : name,primary:tab == name) { [weak self] in self?.selectTab(name) }
+            button.tabStyle = true; if sidebar { button.widthAnchor.constraint(equalToConstant:158).isActive = true }; button.font = NSFont.monospacedSystemFont(ofSize:11,weight:.regular); nav.addArrangedSubview(button)
         }
         nav.addArrangedSubview(NSView())
+        if let release = updater.candidate {
+            let update = ActionButton("● Обновить",primary:true) { [weak self] in self?.activateUpdate() }
+            update.toolTip = "Доступна версия " + release.version; nav.addArrangedSubview(update)
+        }
+    }
+    func selectTab(_ name:String) {
+        tab = name; buildPage()
+        guard !preview, window.isVisible, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return }
+        body.alphaValue = 0.65
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.12
+            body.animator().alphaValue = 1
+        }
     }
     func buildPage() {
+        renderedStatusRevision = ""
         buildNavigation()
-        body.subviews.forEach { $0.removeFromSuperview() }; page = stack(spacing:10); pin(page,inside:body,inset:0)
+        body.subviews.forEach { $0.removeFromSuperview() }; page = stack(spacing:10); let scroll = StackScroll(page); pin(scroll,inside:body,inset:0)
+        consoleProfileButtons = []; consoleEventsField = nil; connectionCheckField = nil
         connectionTitle = nil; connectionMessage = nil; connectionNetwork = nil; connectionProfile = nil; connectionGuard = nil
         switch tab {
         case "Профили": profilesPage()
         case "Домашняя сеть": homePage()
         case "События": eventsPage()
+        case "Настройки": settingsPage()
         default: connectionPage()
         }
         for view in page.arrangedSubviews where !(view is ActionButton) { view.widthAnchor.constraint(equalTo:page.widthAnchor).isActive = true }
         page.addArrangedSubview(NSView())
     }
     func connectionPage() {
-        page.addArrangedSubview(label("[ 01 / CONNECTION ]",size:11,color:Palette.red))
-        connectionTitle = heading(titleForStatus()); page.addArrangedSubview(connectionTitle!)
-        connectionMessage = label(connectionDescription(),color:Palette.dim); page.addArrangedSubview(connectionMessage!)
-        if settings.profiles.isEmpty {
-            page.addArrangedSubview(ActionButton("+ Добавить профиль",primary:true) { [weak self] in self?.importProfile() })
-            page.addArrangedSubview(label("Выбери файл AmneziaWG .conf или перетащи его в это окно.",size:12,color:Palette.dim))
+        let appearance = consoleAppearance
+        let left = stack(spacing:12), right = stack(spacing:10)
+        let rightCard = NSView(); fill(rightCard,color:Palette.panel); rightCard.layer?.cornerRadius = 4; pin(right,inside:rightCard,inset:18)
+        let panels = stack([left,rightCard],vertical:false,spacing:28); panels.alignment = .top
+        let narrow = appearance == .workspace
+        if !narrow { rightCard.widthAnchor.constraint(equalToConstant:258).isActive = true }
+        left.setContentHuggingPriority(.init(1),for:.horizontal)
+        let hero = stack(spacing:9)
+        hero.addArrangedSubview(label("CONNECTION / AMNEZIAWG",size:10,color:appearance == .contrast ? Palette.panel : Palette.dim))
+        connectionTitle = heading(titleForStatus()); connectionTitle?.font = NSFont.monospacedSystemFont(ofSize:32,weight:.medium); paintHeading(connectionTitle!,titleForStatus()); connectionMessage = label(connectionDescription(),size:11,color:Palette.dim)
+        if appearance == .contrast {
+            connectionTitle?.font = NSFont.systemFont(ofSize:29,weight:.semibold)
+            connectionTitle?.textColor = Palette.bg; connectionMessage?.textColor = Palette.panel
         }
-        page.addArrangedSubview(modeButtons())
-        let facts = stack(spacing:12)
-        func fact(_ title:String,_ value:NSTextField) {
-            let key = label(title,color:Palette.dim); key.widthAnchor.constraint(equalToConstant:90).isActive = true
-            value.alignment = .right; value.setContentHuggingPriority(.init(1),for:.horizontal)
-            let row = stack([key,value],vertical:false,spacing:12); facts.addArrangedSubview(row); row.widthAnchor.constraint(equalTo:facts.widthAnchor).isActive = true
+        hero.addArrangedSubview(connectionTitle!); hero.addArrangedSubview(connectionMessage!); let mode = modeButtons(); mode.widthAnchor.constraint(equalToConstant:276).isActive = true; hero.addArrangedSubview(mode)
+        if appearance == .contrast {
+            let card = NSView(); fill(card,color:Palette.ink); card.layer?.cornerRadius = 10
+            pin(hero,inside:card,inset:18); left.addArrangedSubview(card); card.widthAnchor.constraint(equalTo:left.widthAnchor).isActive = true
+        } else { left.addArrangedSubview(hero); hero.widthAnchor.constraint(equalTo:left.widthAnchor).isActive = true }
+        connectionNetwork = label(status.network,size:11); connectionProfile = label(status.profileName ?? selectedProfile()?.name ?? "не выбран",size:11)
+        connectionGuard = label(status.guardActive ? "Заблокирован" : "Разрешён",size:11,color:Palette.dim)
+        connectionCheckField = label(verificationDescription(),size:11)
+        let facts = stack(spacing:18)
+        func cell(_ name:String,_ value:NSTextField) -> NSStackView {
+            let cell = stack([label(name,size:9,color:Palette.dim),value],spacing:8)
+            cell.setContentHuggingPriority(.init(1),for:.horizontal); return cell
         }
-        connectionNetwork = label(status.network); connectionProfile = label(status.profileName ?? selectedProfile()?.name ?? "не выбран")
-        connectionGuard = label(guardDescription(),size:11,color:status.guardActive ? Palette.green : Palette.dim)
-        page.addArrangedSubview(line()); fact("Сеть",connectionNetwork!); fact("Профиль",connectionProfile!); fact("Трафик",label("Весь интернет через VPN")); fact("Защита",connectionGuard!)
-        page.addArrangedSubview(facts); page.addArrangedSubview(line())
-        let actions = stack(vertical:false,spacing:8)
+        for pair in [[cell("СЕТЬ",connectionNetwork!),cell("ПРОФИЛЬ",connectionProfile!)],[cell("ПРОВЕРКА",connectionCheckField!),cell("ПРЯМОЙ ДОСТУП",connectionGuard!)]] {
+            let row = stack(pair,vertical:false,spacing:18); row.distribution = .fillEqually; row.alignment = .top
+            facts.addArrangedSubview(row); row.widthAnchor.constraint(equalTo:facts.widthAnchor).isActive = true
+        }
+        left.addArrangedSubview(facts); facts.widthAnchor.constraint(equalTo:left.widthAnchor).isActive = true
         let check = ActionButton("Проверить связь",primary:true) { [weak self] in self?.command("check") }; check.isEnabled = serviceAvailable
-        let next = ActionButton("Следующий профиль ↗") { [weak self] in self?.command("next") }; next.isEnabled = serviceAvailable
-        actions.addArrangedSubview(check); actions.addArrangedSubview(next); actions.addArrangedSubview(NSView()); page.addArrangedSubview(actions)
-        let setup = stack(vertical:false,spacing:8)
-        if !serviceAvailable { setup.addArrangedSubview(ActionButton("Установить VPN-службу…") { [weak self] in self?.installService() }) }
-        setup.addArrangedSubview(ActionButton("Обновления…") { [weak self] in self?.checkUpdates() }); setup.addArrangedSubview(NSView()); page.addArrangedSubview(setup)
-        page.addArrangedSubview(line()); page.addArrangedSubview(label("ПРИ СБОЕ   Резерв по порядку. Без выхода напрямую.",size:11,color:Palette.dim))
+        let next = ActionButton("Следующий профиль ↗") { [weak self] in self?.command("next") }; next.isEnabled = serviceAvailable && settings.profiles.count > 1
+        check.font = NSFont.monospacedSystemFont(ofSize:11,weight:.regular); next.font = check.font
+        let actions = narrow ? stack([check,next],spacing:8) : stack([check,next],vertical:false,spacing:8)
+        left.addArrangedSubview(actions)
+        if !serviceAvailable { left.addArrangedSubview(ActionButton("Установить VPN-службу…") { [weak self] in self?.installService() }) }
+        left.addArrangedSubview(label("При сбое — резерв по порядку. Прямой доступ закрыт до восстановления.",size:10,color:Palette.dim))
+        right.addArrangedSubview(label("ПРОФИЛИ / ПО ПОРЯДКУ",size:10,color:Palette.dim))
+        for profile in settings.profiles.prefix(3) {
+            let current = profile.id == (status.profileID ?? settings.selectedID)
+            let button = ActionButton(String(profile.name.prefix(19)),primary:current) { [weak self] in self?.settings.selectedID = profile.id; self?.persistAndConfigure() }
+            button.rowStyle = true; button.profileSubtitle = "AmneziaWG"; button.profileState = current ? "выбран" : "резерв"; button.profileMark = current ? "✓" : "·"; button.font = NSFont.monospacedSystemFont(ofSize:11,weight:.regular); button.toolTip = profile.name
+            right.addArrangedSubview(button)
+            button.heightAnchor.constraint(equalToConstant:50).isActive = true; button.widthAnchor.constraint(equalTo:right.widthAnchor).isActive = true
+            consoleProfileButtons.append((profile,button))
+        }
+        let add = ActionButton("+ Добавить профиль",primary:settings.profiles.isEmpty) { [weak self] in self?.importProfile() }; right.addArrangedSubview(add)
+        right.addArrangedSubview(line()); right.addArrangedSubview(label("ПОСЛЕДНИЕ СОБЫТИЯ",size:10,color:Palette.dim))
+        consoleEventsField = label(status.events.suffix(2).joined(separator:"\n"),size:10,color:Palette.dim); right.addArrangedSubview(consoleEventsField!)
+        if appearance == .contrast {
+            left.removeArrangedSubview(left.arrangedSubviews.first!); let card = left.subviews.first { $0.subviews.contains(hero) }!
+            left.constraints.filter { $0.firstItem === card || $0.secondItem === card }.forEach { $0.isActive = false }; card.removeFromSuperview(); page.addArrangedSubview(card); card.widthAnchor.constraint(equalTo:page.widthAnchor).isActive = true
+            page.addArrangedSubview(panels)
+        } else if narrow {
+            page.addArrangedSubview(left)
+            page.addArrangedSubview(rightCard)
+        } else { page.addArrangedSubview(panels) }
     }
     func modeButtons() -> NSStackView {
         let modes = stack(vertical:false,spacing:0)
@@ -284,7 +358,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         for (index,profile) in settings.profiles.enumerated() {
             let row = stack(vertical:false,spacing:6)
             let active = profile.id == (status.profileID ?? settings.selectedID)
-            let select = ActionButton("\(active ? "✓" : String(index+1))  \(String(profile.name.prefix(28)))",primary:active) { [weak self] in self?.settings.selectedID = profile.id; self?.persistAndConfigure() }
+            let select = ActionButton("\(active ? "✓" : String(index+1))  \(String(profile.name.prefix(consoleAppearance == .workspace ? 14 : 28)))",primary:active) { [weak self] in self?.settings.selectedID = profile.id; self?.persistAndConfigure() }
             select.rowStyle = true; select.setContentHuggingPriority(.init(1),for:.horizontal); row.addArrangedSubview(select)
             let protocolLabel = label("AWG 3.1",size:11,color:Palette.dim); protocolLabel.widthAnchor.constraint(equalToConstant:68).isActive = true; row.addArrangedSubview(protocolLabel)
             row.addArrangedSubview(ActionButton("↑") { [weak self] in guard let self = self, index > 0 else { return }; self.settings.profiles.swapAt(index,index-1); self.persistAndConfigure() })
@@ -314,6 +388,54 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         let login = NSButton(checkboxWithTitle:"Запускать AutoTurn при входе",target:self,action:#selector(toggleLogin(_:))); login.state = settings.launchAtLogin ? .on : .off; page.addArrangedSubview(login)
         page.addArrangedSubview(label("В настройках геолокации включи службы геолокации и разреши AutoTurn. После разрешения текущая сеть появится здесь; нажми «Сохранить сети». Ethernet считаем внешней сетью.",size:11,color:Palette.dim))
     }
+    func settingsPage() {
+        page.addArrangedSubview(label("[ 05 / PREFERENCES ]",size:11,color:Palette.red))
+        page.addArrangedSubview(heading("Настройки_"))
+        page.addArrangedSubview(label("ОФОРМЛЕНИЕ ШТОРКИ",size:11,color:Palette.dim))
+        let options = stack(vertical:false,spacing:8)
+        for style in MenuAppearance.allCases {
+            options.addArrangedSubview(ActionButton(style.title,primary:menuAppearance == style) { [weak self] in
+                UserDefaults.standard.set(style.rawValue,forKey:"appearance.menu")
+                self?.buildPage(); self?.refreshOpenMenu()
+            })
+        }
+        page.addArrangedSubview(options)
+        page.addArrangedSubview(label("Оформление меняется сразу. Режим VPN и профили сохраняются.",size:11,color:Palette.dim))
+        page.addArrangedSubview(label("ОФОРМЛЕНИЕ ПУЛЬТА",size:11,color:Palette.dim))
+        let consoles = stack(vertical:consoleAppearance == .workspace,spacing:8)
+        for style in ConsoleAppearance.allCases {
+            consoles.addArrangedSubview(ActionButton(style.title,primary:consoleAppearance == style) { [weak self] in
+                UserDefaults.standard.set(style.rawValue,forKey:"appearance.console"); self?.buildPage()
+            })
+        }
+        page.addArrangedSubview(consoles)
+        page.addArrangedSubview(line())
+        page.addArrangedSubview(label("ОБНОВЛЕНИЯ / GITHUB",size:11,color:Palette.dim))
+        page.addArrangedSubview(label("Проверяем раз в час, пока AutoTurn запущен. После сна — при пробуждении. Уведомление приходит только для новой версии.",color:Palette.dim))
+        page.addArrangedSubview(ActionButton(updater.candidate.map { "● Обновить до \($0.version)" } ?? "Проверить обновления",primary:updater.candidate != nil) { [weak self] in self?.activateUpdate() })
+        page.addArrangedSubview(ActionButton("Настройки уведомлений macOS…") {
+            NSWorkspace.shared.open(URL(string:"x-apple.systempreferences:com.apple.Notifications-Settings.extension")!)
+        })
+        let login = NSButton(checkboxWithTitle:"Запускать AutoTurn при входе",target:self,action:#selector(toggleLogin(_:)))
+        login.state = settings.launchAtLogin ? .on : .off; page.addArrangedSubview(login)
+    }
+    func activateUpdate() {
+        guard !checkingUpdate else { return }
+        popover.performClose(nil)
+        if let release = updater.candidate { presentUpdate(release) } else { checkUpdates() }
+    }
+    func showMoreMenu() {
+        let menu = NSMenu()
+        func add(_ title:String,_ action:@escaping () -> Void) { menu.addItem(ClosureMenuItem(title,action:action)) }
+        add("Настройки…") { [weak self] in self?.tab = "Настройки"; self?.openWindow() }
+        add("Домашние сети…") { [weak self] in self?.tab = "Домашняя сеть"; self?.openWindow() }
+        add("+ Добавить профиль…") { [weak self] in self?.openWindow(); self?.importProfile() }
+        add("Диагностика…") { [weak self] in self?.tab = "События"; self?.openWindow() }
+        add("Проверить обновления…") { [weak self] in self?.checkUpdates() }
+        menu.addItem(.separator())
+        add("Завершить…") { [weak self] in self?.quit() }
+        if let view = popover.contentViewController?.view { menu.popUp(positioning:nil,at:NSPoint(x:170,y:view.bounds.height-58),in:view) }
+    }
     func addHomeSSID(_ ssid:String,to field:NSTextField) {
         var homes = field.stringValue.components(separatedBy:CharacterSet(charactersIn:",\n")).map { $0.trimmingCharacters(in:.whitespaces) }.filter { !$0.isEmpty }
         if !homes.contains(ssid) { homes.append(ssid) }
@@ -341,68 +463,100 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         statusItem.button?.image = StatusIcon.unknown.image; statusItem.button?.title = ""
         statusItem.button?.target = self; statusItem.button?.action = #selector(togglePopover)
         statusItem.button?.toolTip = "AutoTurn · powered by LENCHA"
-        popover.behavior = .transient; popover.animates = false; popover.delegate = self
+        popover.onClose = { [weak self] in self?.stopPopoverMonitoring() }
     }
     func menuView() -> NSView {
-        let view = FlippedDocument(frame:NSRect(x:0,y:0,width:292,height:600)); fill(view)
-        var y: CGFloat = 18
-        func place(_ child:NSView,_ height:CGFloat,_ x:CGFloat = 16,_ width:CGFloat = 260) {
+        let style = menuAppearance, width:CGFloat = 332, inset:CGFloat = 20, inner:CGFloat = 292
+        let view = FlippedDocument(frame:NSRect(x:0,y:0,width:width,height:600)); fill(view)
+        view.layer?.cornerRadius = style == .instrument ? 4 : 14
+        var y:CGFloat = 18
+        func place(_ child:NSView,_ height:CGFloat,_ x:CGFloat = 20,_ w:CGFloat = 292) {
             child.translatesAutoresizingMaskIntoConstraints = true
-            child.frame = NSRect(x:x,y:y,width:width,height:height); view.addSubview(child)
+            child.frame = NSRect(x:x,y:y,width:w,height:height); view.addSubview(child)
         }
-        func divider() { y += 7; place(line(),1); y += 8 }
-        func row(_ text:String,_ icon:String? = nil,_ action:@escaping () -> Void) {
-            let button = ActionButton(text,action:action); button.menuStyle = true; button.menuIcon = icon
-            place(button,34); y += 34
+        func rule() { place(line(),1); y += 16 }
+        func row(_ title:String,_ height:CGFloat = 34,_ action:@escaping () -> Void) {
+            let button = ActionButton(title,action:action); button.menuStyle = true; place(button,height); y += height
         }
-        let brand = label("AUTOTURN_",size:18)
-        let word = NSMutableAttributedString(string:"AUTOTURN",attributes:[.font:brand.font!,.foregroundColor:Palette.ink])
-        word.append(NSAttributedString(string:"_",attributes:[.font:brand.font!,.foregroundColor:Palette.red])); brand.attributedStringValue = word
-        place(brand,24,16,195); place(label("HL100",size:11,color:Palette.dim),18,232,44)
-        y += 37; place(line(),1); y += 17
-        let dot = NSView(); fill(dot,color:status.phase == .connected ? Palette.green : status.phase == .error || status.phase == .recovering ? Palette.red : status.phase == .connecting || status.phase == .waiting ? NSColor.systemOrange : Palette.dim)
-        place(dot,7,16,7); dot.frame.origin.y += 5
-        let message = label(connectionDescription(),size:12)
-        let messageHeight = max(18,ceil((message.stringValue as NSString).boundingRect(with:NSSize(width:244,height:200),options:[.usesLineFragmentOrigin,.usesFontLeading],attributes:[.font:message.font!]).height)+3)
-        place(message,messageHeight,32,244); y += messageHeight+6
-        let reason = needsLocationPermission() ? "Wi-Fi не определён" : status.phase == .home ? "Домашняя сеть" : status.phase == .waiting ? "Сеть недоступна" : status.phase == .off ? "Выключено вручную" : status.phase == .setup ? "Настройка" : "Вне дома"
-        let detail = label("\(reason) · \(status.profileName ?? selectedProfile()?.name ?? "нет профиля")",size:11,color:Palette.dim)
-        detail.maximumNumberOfLines = 1; detail.lineBreakMode = .byTruncatingTail
-        place(detail,18); y += 34
+        let brand = label("AUTOTURN_",size:15); paintHeading(brand,"AUTOTURN_"); place(brand,22,20,220)
+        place(label("HL100",size:10,color:Palette.dim),18,268,44); y += 38
+        if style == .instrument { rule() }
+        let stateTitle:String
+        if needsLocationPermission() { stateTitle = "Нужен доступ к Wi-Fi" }
+        else { switch status.phase {
+            case .home: stateTitle = "Дома"
+            case .connected: stateTitle = "Под защитой"
+            case .connecting: stateTitle = "Проверяем связь"
+            case .recovering: stateTitle = "Восстановление"
+            case .waiting: stateTitle = "Ждём сеть"
+            case .off: stateTitle = "Выключено"
+            case .setup: stateTitle = "Добавь профиль"
+            case .error: stateTitle = "Нужно внимание"
+        } }
+        let cardTop = y
+        if style == .card {
+            let card = NSView(); fill(card,color:Palette.ink); card.layer?.cornerRadius = 10
+            place(card,110); y += 12
+        } else if style == .instrument {
+            let accent = NSView(); fill(accent,color:Palette.red); place(accent,83,20,3)
+        }
+        let heroX:CGFloat = style == .instrument ? 35 : style == .card ? 32 : 20
+        let heroWidth = width-heroX-32
+        let title = label(stateTitle + (style == .instrument ? "_" : ""),size:style == .card ? 26 : 23,color:style == .card ? Palette.bg : Palette.ink)
+        if style == .instrument { paintHeading(title,title.stringValue) }
+        else { title.font = NSFont.systemFont(ofSize:26,weight:.semibold) }
+        place(title,32,heroX,heroWidth); y += 38
+        let network = label(needsLocationPermission() ? "Название Wi-Fi недоступно" : status.network,size:11,color:style == .card ? Palette.panel : Palette.dim)
+        network.maximumNumberOfLines = 1; network.lineBreakMode = .byTruncatingTail
+        place(network,18,heroX,heroWidth); y += 24
+        let detail = label(status.phase == .home ? "Интернет через роутер" : status.phase == .connected ? "Интернет через VPN" : status.phase == .off ? "Автоматика приостановлена" : status.phase == .recovering ? "Прямой доступ закрыт" : "Состояние соединения",size:11,color:style == .card ? Palette.panel : status.phase == .connected ? Palette.green : Palette.dim)
+        place(detail,18,heroX,heroWidth); y = max(y+34,cardTop+(style == .card ? 124 : 0))
         for (index,mode) in [Mode.auto,.on,.off].enumerated() {
             let button = ActionButton(["Авто","Вкл.","Выкл."][index],primary:settings.mode == mode) { [weak self] in self?.setMode(mode) }
-            place(button,36,16+CGFloat(index)*260/3,260/3)
+            button.cornerRadius = style == .instrument ? 2 : 6; button.creamPrimary = style != .instrument
+            place(button,34,inset+CGFloat(index)*inner/3,inner/3)
         }
-        y += 60; place(label("ПРОФИЛИ / ПО ПОРЯДКУ",size:11,color:Palette.dim),18); y += 27
-        for (index,profile) in settings.profiles.prefix(3).enumerated() {
-            let selected = profile.id == (status.profileID ?? settings.selectedID ?? settings.profiles.first?.id)
+        y += 52
+        if style == .instrument {
+            rule()
+            let check = status.verifiedAt.map { date -> String in let formatter = DateFormatter(); formatter.dateFormat = "HH:mm:ss"; return "HTTPS · " + formatter.string(from:date) } ?? (status.phase == .home ? "VPN не требуется" : "Не подтверждена")
+            place(label("Проверка",size:10,color:Palette.dim),18,20,92); place(label(check,size:10),18,115,197); y += 27
+            place(label("Прямой доступ",size:10,color:Palette.dim),18,20,118)
+            place(label(status.guardActive ? "закрыт" : "разрешён",size:10),18,180,132); y += 31; rule()
+        }
+        place(label("ПРОФИЛИ / \(String(format:"%02d",settings.profiles.count))",size:10,color:Palette.dim),16); y += 22
+        let currentID = status.profileID ?? settings.selectedID ?? settings.profiles.first?.id
+        let shown = style == .card ? settings.profiles.filter { $0.id == currentID } : Array(settings.profiles.prefix(3))
+        for profile in shown {
+            let index = settings.profiles.firstIndex { $0.id == profile.id } ?? 0
+            let selected = profile.id == currentID
             let button = ActionButton(profile.name,primary:selected) { [weak self] in self?.settings.selectedID = profile.id; self?.persistAndConfigure() }
             button.rowStyle = true; button.profileSubtitle = "AmneziaWG"; button.profileMark = selected ? "✓" : String(format:"%02d",index+1)
-            button.profileState = selected ? (status.phase == .connected ? "активен" : status.phase == .connecting ? "проверка" : status.phase == .waiting ? "ожидание" : status.phase == .recovering || status.phase == .error ? "нет связи" : "выбран") : "резерв"
+            button.profileState = selected ? (status.phase == .connected ? "активен" : status.phase == .home || status.phase == .off ? "готов" : "проверка") : "резерв"
             button.toolTip = profile.name; place(button,50); y += 50
         }
-        if settings.profiles.isEmpty { place(label("Импортируй AmneziaWG .conf",size:11,color:Palette.dim),18); y += 18 }
-        if settings.profiles.count > 3 { row("Все профили…","slider.horizontal.3") { [weak self] in self?.tab = "Профили"; self?.openWindow() } }
-        divider()
-        row("Проверить связь","waveform.path.ecg") { [weak self] in self?.command("check") }
-        row("Следующий профиль","arrow.right") { [weak self] in self?.command("next") }
-        divider()
-        row("Домашняя сеть…","house") { [weak self] in self?.tab = "Домашняя сеть"; self?.openWindow() }
-        row("Открыть пульт…","slider.horizontal.3") { [weak self] in self?.openWindow() }
-        if needsLocationPermission() { row("Разрешить определение Wi-Fi…","location") { [weak self] in self?.observer.requestPermission() } }
-        row("Диагностика…","terminal") { [weak self] in self?.tab = "События"; self?.openWindow() }
-        row("+ Добавить профиль…") { [weak self] in self?.openWindow(); self?.importProfile() }
-        row(updater.candidate.map { "Обновить до \($0.version)…" } ?? "Проверить обновления…","arrow.triangle.2.circlepath") { [weak self] in self?.checkUpdates() }
-        divider(); row("Завершить…") { [weak self] in self?.quit() }
-        y += 9; place(line(),1); y += 14
-        let credit = label("powered by LENCHA_",size:11,color:Palette.dim)
+        if settings.profiles.isEmpty { row("+ Добавить профиль…") { [weak self] in self?.importProfile() } }
+        else if style == .card || settings.profiles.count > 3 { row("Все профили…") { [weak self] in self?.tab = "Профили"; self?.openWindow() } }
+        y += 12
+        let check = ActionButton("Проверить связь",primary:style == .calm) { [weak self] in self?.command("check") }
+        check.cornerRadius = style == .instrument ? 2 : 7; check.isEnabled = serviceAvailable; place(check,36,20,246)
+        let next = ActionButton("→") { [weak self] in self?.command("next") }; next.toolTip = "Следующий профиль"; next.isEnabled = serviceAvailable && settings.profiles.count > 1; next.cornerRadius = check.cornerRadius; place(next,36,274,38); y += 50
+        if needsLocationPermission() { row("Разрешить определение Wi-Fi…") { [weak self] in self?.observer.requestPermission() } }
+        if let release = updater.candidate {
+            let update = ActionButton("● Обновить до \(release.version)",primary:true) { [weak self] in self?.activateUpdate() }
+            update.cornerRadius = check.cornerRadius; place(update,36); y += 48
+        }
+        rule()
+        let console = ActionButton("Открыть пульт ↗") { [weak self] in self?.openWindow() }; console.menuStyle = true; place(console,28,20,214)
+        let more = ActionButton("Ещё ···") { [weak self] in self?.showMoreMenu() }; more.menuStyle = true; place(more,28,240,72); y += 40
+        let credit = label("powered by LENCHA_",size:10,color:Palette.dim)
         let signature = NSMutableAttributedString(string:credit.stringValue,attributes:[.font:credit.font!,.foregroundColor:Palette.dim])
         signature.addAttribute(.foregroundColor,value:Palette.red,range:(credit.stringValue as NSString).range(of:"LENCHA_")); credit.attributedStringValue = signature
-        place(credit,18,21,250); y += 29
-        view.frame.size.height = y; view.layoutSubtreeIfNeeded(); return view
+        place(credit,18); y += 30
+        view.frame.size.height = y; return view
     }
     func menuRevision() -> String {
-        ([settings.mode.rawValue,status.phase.rawValue,connectionDescription(),status.network,status.profileID ?? "",settings.selectedID ?? "",String(status.guardActive),String(serviceAvailable),String(updater.candidate?.build ?? 0)] + settings.profiles.map { $0.id + $0.name }).joined(separator:"\u{1f}")
+        ([settings.mode.rawValue,status.phase.rawValue,connectionDescription(),status.network,status.profileID ?? "",settings.selectedID ?? "",String(status.guardActive),String(serviceAvailable),String(updater.candidate?.build ?? 0),menuAppearance.rawValue,status.verifiedAt.map { String($0.timeIntervalSince1970) } ?? ""] + settings.profiles.map { $0.id + $0.name }).joined(separator:"\u{1f}")
     }
     func refreshOpenMenu() {
         guard popover.isShown, renderedMenuRevision != menuRevision() else { return }
@@ -421,14 +575,12 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         if let monitor = globalClickMonitor { NSEvent.removeMonitor(monitor); globalClickMonitor = nil }
         if let observer = resignObserver { NotificationCenter.default.removeObserver(observer); resignObserver = nil }
     }
-    func popoverDidClose(_ notification:Notification) { stopPopoverMonitoring() }
     @objc func togglePopover() {
         if popover.isShown { popover.performClose(nil); return }
         let controller = NSViewController(); controller.view = menuView()
         popover.contentViewController = controller; popover.contentSize = controller.view.frame.size
         renderedMenuRevision = menuRevision()
         guard let button = statusItem.button else { return }
-        NSApp.activate(ignoringOtherApps:true)
         popover.show(relativeTo:button.bounds,of:button,preferredEdge:.minY)
         controller.view.window?.makeKey()
         stopPopoverMonitoring()
@@ -447,15 +599,33 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
     func connectionDescription() -> String {
         needsLocationPermission() ? "Разреши геолокацию для определения домашнего Wi-Fi. Пока сеть не определена, VPN остаётся включён." : status.message
     }
-    func titleForStatus() -> String { switch status.phase { case .setup:return "Начнём с профиля_"; case .home:return "Ты дома_"; case .connecting:return "Проверяем связь_"; case .connected:return "На связи_"; case .waiting:return "Ждём сеть_"; case .recovering:return "Держим VPN_"; case .off:return "Выключено вручную_"; case .error:return "Нужно внимание_" } }
+    func titleForStatus() -> String { switch status.phase { case .setup:return "Начнём с профиля_"; case .home:return "Ты дома_"; case .connecting:return "Проверяем связь_"; case .connected:return "Под защитой_"; case .waiting:return "Ждём сеть_"; case .recovering:return "Восстанавливаем_"; case .off:return "Выключено вручную_"; case .error:return "Нужно внимание_" } }
+    func verificationDescription() -> String {
+        if status.phase == .home { return "VPN не требуется" }
+        if let date = status.verifiedAt {
+            let formatter = DateFormatter(); formatter.dateFormat = "HH:mm:ss"
+            return "HTTPS · " + formatter.string(from:date)
+        }
+        return "Не подтверждена"
+    }
     func guardDescription() -> String { if !serviceAvailable { return FileManager.default.fileExists(atPath:"/Library/LaunchDaemons/ru.hl100.autoturn.helper.plist") ? "Состояние службы и блокировки не подтверждено" : "VPN-служба ещё не установлена; интернет не изменён" }; return status.guardActive ? "Прямой трафик заблокирован" : "Блокировка прямого доступа выключена" }
     func selectedProfile() -> Profile? { settings.profiles.first { $0.id == settings.selectedID } ?? settings.profiles.first }
     func updateStatus() {
-        if let title = connectionTitle { paintHeading(title,titleForStatus()) }; connectionMessage?.stringValue = connectionDescription(); connectionNetwork?.stringValue = status.network; connectionProfile?.stringValue = status.profileName ?? selectedProfile()?.name ?? "не выбран"; connectionGuard?.stringValue = guardDescription(); connectionGuard?.textColor = status.guardActive ? Palette.green : Palette.dim
+        let revision = menuRevision() + consoleAppearance.rawValue + (status.profileName ?? "") + status.events.suffix(2).joined(separator:"\n")
+        guard renderedStatusRevision != revision else { return }
+        renderedStatusRevision = revision
+        if let title = connectionTitle { paintHeading(title,titleForStatus()); if consoleAppearance == .contrast { title.textColor = Palette.bg; title.attributedStringValue = NSAttributedString(string:titleForStatus(),attributes:[.font:title.font!,.foregroundColor:Palette.bg]) } }; connectionMessage?.stringValue = connectionDescription(); connectionNetwork?.stringValue = status.network; connectionProfile?.stringValue = status.profileName ?? selectedProfile()?.name ?? "не выбран"; connectionGuard?.stringValue = status.guardActive ? "Заблокирован" : "Разрешён"; connectionCheckField?.stringValue = verificationDescription(); connectionGuard?.textColor = status.guardActive ? Palette.green : Palette.dim
+        for (profile,button) in consoleProfileButtons {
+            button.primary = profile.id == (status.profileID ?? settings.selectedID)
+            button.profileState = button.primary ? (status.phase == .connected ? "активен" : status.phase == .home || status.phase == .off ? "готов" : "проверка") : "резерв"
+            button.needsDisplay = true
+        }
+        consoleEventsField?.stringValue = status.events.suffix(2).joined(separator:"\n")
         let modeName = settings.mode == .auto ? "АВТО" : settings.mode == .on ? "ВРУЧНУЮ" : "ВЫКЛЮЧЕНО"
         let phaseNames: [Phase:String] = [.setup:"НАСТРОЙКА",.home:"ДОМА",.connecting:"ПОДКЛЮЧЕНИЕ",.connected:"ПРОВЕРЕНО",.waiting:"ОЖИДАНИЕ",.recovering:"РЕЗЕРВ",.off:"ПАУЗА",.error:"ОШИБКА"]
         footer?.stringValue = "\(modeName) / \(phaseNames[status.phase] ?? "")"
-        statusItem.button?.image = StatusIcon.state(status.phase,missingLocation:needsLocationPermission()).image
+        let icon = StatusIcon.state(status.phase,missingLocation:needsLocationPermission()).image
+        if statusItem.button?.image !== icon { statusItem.button?.image = icon }
         statusItem.button?.title = ""; statusItem.button?.toolTip = "AutoTurn · \(connectionDescription())"
         refreshOpenMenu()
         if observeLiveNetwork && observedRevision != menuRevision() {
@@ -527,7 +697,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         center.getNotificationSettings { settings in
             if settings.authorizationStatus == .notDetermined { center.requestAuthorization(options:[.alert]) { _,_ in } }
         }
-        updateTimer = Timer(timeInterval:15*60,repeats:true) { [weak self] _ in self?.checkAutomaticUpdates() }
+        updateTimer = Timer(timeInterval:60,repeats:true) { [weak self] _ in self?.checkAutomaticUpdates() }
         RunLoop.main.add(updateTimer!,forMode:.common)
         checkAutomaticUpdates()
     }
@@ -546,10 +716,11 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
             switch result {
             case .failure(let error): if manual { self.showError(error) }
             case .success(let release):
-                self.updateHistory.succeeded(); self.refreshOpenMenu()
+                self.updateHistory.succeeded(); self.buildNavigation(); self.refreshOpenMenu()
+                if self.tab == "Настройки" { self.buildPage() }
                 if let release = release {
                     if manual { self.presentUpdate(release) }
-                    else if self.updateHistory.shouldNotify(release.build) { self.notifyUpdate(release) }
+                    else if self.updateHistory.shouldNotify(version:release.version,build:release.build) { self.notifyUpdate(release) }
                 } else if manual { self.info("Установлена актуальная версия AutoTurn.") }
             }
         }
@@ -563,19 +734,21 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         }
     }
     func notifyUpdate(_ release:MacRelease) {
+        guard updateHistory.shouldNotify(version:release.version,build:release.build), !notifyingVersions.contains(release.version) else { return }
+        notifyingVersions.insert(release.version)
         let center = UNUserNotificationCenter.current()
         center.getNotificationSettings { [weak self] settings in
-            guard settings.authorizationStatus == .authorized else { return }
+            guard settings.authorizationStatus == .authorized else { DispatchQueue.main.async { self?.notifyingVersions.remove(release.version) }; return }
             let content = UNMutableNotificationContent()
             content.title = "Доступен AutoTurn \(release.version)"
             content.body = "Нажми, чтобы открыть обновление. Профили и настройки сохранятся."
             let request = UNNotificationRequest(identifier:"autoturn-update-\(release.build)",content:content,trigger:nil)
-            center.add(request) { error in if error == nil { DispatchQueue.main.async { self?.updateHistory.notified(release.build) } } }
+            center.add(request) { error in DispatchQueue.main.async { self?.notifyingVersions.remove(release.version); if error == nil { self?.updateHistory.notified(version:release.version,build:release.build) } } }
         }
     }
     func userNotificationCenter(_ center:UNUserNotificationCenter,willPresent notification:UNNotification,withCompletionHandler completionHandler:@escaping (UNNotificationPresentationOptions) -> Void) { completionHandler([.banner,.list]) }
     func userNotificationCenter(_ center:UNUserNotificationCenter,didReceive response:UNNotificationResponse,withCompletionHandler completionHandler:@escaping () -> Void) {
-        DispatchQueue.main.async { self.openWindow(); self.checkUpdates() }; completionHandler()
+        DispatchQueue.main.async { self.openWindow(); self.activateUpdate() }; completionHandler()
     }
     func offerInstallation(_ archive: URL, release: MacRelease) {
         guard confirm("Обновление проверено",detail:"Установить и перезапустить AutoTurn? Профили сохранятся. Для обновления VPN-службы macOS запросит права администратора.") else { return }
@@ -673,6 +846,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         var iconImages = Set<Data>()
         for icon in StatusIcon.allCases {
             let image = icon.image
+            require(image === icon.image,"status artwork must be reused between polls")
             require(image.isTemplate && image.size == NSSize(width:18,height:18),"status icon dimensions/template")
             guard let data = image.tiffRepresentation, let bitmap = NSBitmapImageRep(data:data) else { require(false,"status icon rasterization"); return }
             require(bitmap.pixelsWide >= 18 && bitmap.pixelsHigh >= 18,"status icon raster size")
@@ -685,7 +859,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
             settings.profiles = profiles
             for width in [CGFloat(700),760,1000] {
                 window.setContentSize(NSSize(width:width,height:700))
-                for name in ["Соединение","Профили","Домашняя сеть","События"] {
+                for name in ["Соединение","Профили","Домашняя сеть","События","Настройки"] {
                     tab = name; buildPage(); window.contentView?.layoutSubtreeIfNeeded()
                     require(abs(window.contentView!.bounds.width-width)<1,"window width changed")
                     require(body.bounds.width == width-48,"content margins")
@@ -696,13 +870,13 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
                     for view in page.arrangedSubviews { require(view.frame.minY >= -1 && view.frame.maxY <= page.bounds.height+1,"clipped content in \(name)") }
                 }
             }
-            let menu = menuView(); menu.layoutSubtreeIfNeeded(); require(buttons(menu).contains { $0.title == "+ Добавить профиль…" },"menu import missing")
-            require(menu.bounds.width == 292,"menu width differs from approved design")
-            require(buttons(menu).contains { $0.title == "Диагностика…" && $0.menuIcon == "terminal" },"menu diagnostics missing")
+            let menu = menuView(); menu.layoutSubtreeIfNeeded(); require(buttons(menu).contains { $0.title == "Ещё ···" },"menu management missing")
+            require(menu.bounds.width == 332,"menu width differs from approved design")
+            require(buttons(menu).contains { $0.title == "Открыть пульт ↗" },"console shortcut missing")
             require(buttons(menu).filter { $0.profileSubtitle != nil }.count == profiles.count,"menu profile rows missing")
             for button in buttons(menu) {
                 let frame = button.convert(button.bounds,to:menu)
-                require(frame.minX >= 16 && frame.maxX <= 276.1 && frame.minY >= 0 && frame.maxY <= menu.bounds.height,"clipped menu action")
+                require(frame.minX >= 20 && frame.maxX <= 312.1 && frame.minY >= 0 && frame.maxY <= menu.bounds.height,"clipped menu action")
                 if button.profileSubtitle != nil { require(frame.height == 50 && button.rowStyle,"menu profile layout") }
             }
             func checkCredits(_ view:NSView) { if let field = view as? NSTextField, field.stringValue.contains("LENCHA_") { let frame = field.convert(field.bounds,to:menu); require(frame.width > 40 && frame.maxX <= menu.bounds.width && frame.minX >= 0 && frame.minY >= 0,"clipped menu credit") }; view.subviews.forEach { checkCredits($0) } }
@@ -710,6 +884,50 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
             let mark = menu.subviews.compactMap { $0 as? NSTextField }.first { $0.stringValue == "HL100" }
             require(mark != nil && mark!.frame.width >= mark!.intrinsicContentSize.width,"HL100 label clipped")
         }
+        let mockRelease = MacRelease(version:"9.9.9",build:999,minimumOS:"13.0",archiveURL:"",sha256:"",signature:"",notes:"")
+        updater.candidate = mockRelease
+        for appearance in MenuAppearance.allCases {
+            testMenuAppearance = appearance
+            for phase in [Phase.home,.connected,.recovering,.off,.setup] {
+                status.phase = phase
+                let menu = menuView(); menu.layoutSubtreeIfNeeded()
+                require(buttons(menu).contains { $0.title == "● Обновить до 9.9.9" },"available update missing from menu")
+                for button in buttons(menu) {
+                    let frame = button.convert(button.bounds,to:menu)
+                    require(frame.minX >= 20 && frame.maxX <= 312.1 && frame.maxY <= menu.bounds.height,"menu theme clips action")
+                }
+            }
+        }
+        testMenuAppearance = nil
+        for appearance in ConsoleAppearance.allCases {
+            testConsoleAppearance = appearance
+            for width in [CGFloat(700),760] {
+                window.setContentSize(NSSize(width:width,height:700))
+                for name in ["Соединение","Профили","Домашняя сеть","События","Настройки"] {
+                    tab = name; buildPage(); window.contentView?.layoutSubtreeIfNeeded()
+                    require(abs(window.contentView!.bounds.width-width)<1,"theme changed window size")
+                    for button in buttons(body) {
+                        let frame = button.convert(button.bounds,to:body)
+                        require(button.frame.width > 20 && button.frame.height >= 36,"theme collapsed control")
+                        require(frame.minX >= -1 && frame.maxX <= body.bounds.width+1,"theme action exceeds content width")
+                    }
+                    if name == "Соединение" { require(buttons(body).contains { $0.title == "Проверить связь" },"console theme lost check action") }
+                    if name == "Настройки" { require(buttons(body).filter { ConsoleAppearance.allCases.map(\.title).contains($0.title) }.count == 3,"console themes missing") }
+                }
+            }
+        }
+        testConsoleAppearance = nil
+        tab = "Настройки"; buildPage(); window.contentView?.layoutSubtreeIfNeeded()
+        require(buttons(body).filter { MenuAppearance.allCases.map(\.title).contains($0.title) }.count == 3,"appearance choices missing")
+        require(buttons(body).contains { $0.title == "● Обновить до 9.9.9" },"settings update missing")
+        require(navigation!.arrangedSubviews.compactMap { $0 as? ActionButton }.contains { $0.title == "● Обновить" },"global update badge missing")
+        for width in [CGFloat(700),760] {
+            window.setContentSize(NSSize(width:width,height:700)); window.contentView?.layoutSubtreeIfNeeded()
+            for button in navigation!.arrangedSubviews.compactMap({ $0 as? ActionButton }) {
+                require(button.frame.maxX <= navigation!.bounds.width+1 && button.frame.minX >= 0,"navigation/update indicator clipped")
+            }
+        }
+        updater.candidate = nil
         tab = "Домашняя сеть"; buildPage(); window.contentView?.layoutSubtreeIfNeeded()
         let homeField = page.arrangedSubviews.compactMap { $0 as? NSTextField }.first { $0.placeholderString != nil }!
         homeField.stringValue = "ExistingHome"; pendingHomeField = homeField
@@ -727,6 +945,17 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         status.phase = .connected; status.message = "VPN подключён · трафик проверен"; status.guardActive = true
         updateStatus()
         require(popover.isShown && popover.contentViewController!.view !== previousView,"open menu did not refresh in place")
+        require(popover.window.styleMask.contains(.nonactivatingPanel),"menu must not activate another Space")
+        require(popover.window.collectionBehavior.contains(.fullScreenAuxiliary),"menu missing full-screen support")
+        let fixedFrame = popover.window.frame
+        let anchorWindow = statusItem.button!.window!
+        let anchorFrame = anchorWindow.frame
+        anchorWindow.setFrameOrigin(NSPoint(x:anchorFrame.minX,y:anchorFrame.minY+60))
+        require(popover.window.frame == fixedFrame && popover.isShown,"menu followed auto-hiding status-bar anchor")
+        // A live status refresh must keep the menu's screen anchor, too.
+        status.message += " · обновлено"; updateStatus()
+        require(popover.window.frame.maxY == fixedFrame.maxY && popover.window.frame.maxX == fixedFrame.maxX,"live refresh moved floating menu")
+        anchorWindow.setFrame(anchorFrame,display:false)
         let unchangedView = popover.contentViewController!.view; updateStatus()
         require(popover.contentViewController!.view === unchangedView,"unchanged status rebuilt menu")
         if let inside = NSEvent.mouseEvent(with:.leftMouseDown,location:.zero,modifierFlags:[],timestamp:0,windowNumber:popover.contentViewController!.view.window!.windowNumber,context:nil,eventNumber:1,clickCount:1,pressure:1) {
@@ -737,7 +966,11 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         }
         stopPopoverMonitoring()
         require(localClickMonitor == nil && globalClickMonitor == nil && resignObserver == nil,"popover monitors leaked")
-        print("UI checks passed: four tabs, profile layouts, open menu refresh without reopening, unchanged status preserves view, inside/outside clicks, monitor cleanup and file drop. No Keychain or network changes.")
+        let start = CFAbsoluteTimeGetCurrent()
+        for _ in 0..<1000 { updateStatus() }
+        let milliseconds = (CFAbsoluteTimeGetCurrent()-start)*1000/1000
+        print(String(format:"Unchanged UI update: %.3f ms per call (1000 calls); no layout rebuild. This is not a display FPS measurement.",milliseconds))
+        print("UI checks passed: five tabs, three menu themes, update indicators, profile layouts, open menu refresh without reopening, unchanged status preserves view, inside/outside clicks, monitor cleanup and file drop. No Keychain or network changes.")
         NSApp.terminate(nil)
     }
     func renderPreview() {
@@ -747,8 +980,11 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
             settings.profiles = ["Основной","Резервный","Дальний"].map { Profile(name:$0,addresses:["10.0.0.2/32"],dns:["1.1.1.1"],mtu:1280,interface:[:],peer:[:],endpointHost:"198.51.100.10",endpointPort:51820,resolvedIP:"198.51.100.10") }; settings.selectedID = settings.profiles.first?.id
         }
         if CommandLine.arguments.contains("--preview-connected") {
+            serviceAvailable = true
             status = ServiceStatus(phase:.connected,mode:.auto,profileID:settings.selectedID,profileName:selectedProfile()?.name,network:"Другая Wi-Fi-сеть",message:"VPN подключён · связь проверена",guardActive:true,verifiedAt:Date(),events:[],tunnel:nil)
         }
+        if let i = CommandLine.arguments.firstIndex(of:"--preview-console-style"), i+1 < CommandLine.arguments.count { testConsoleAppearance = ConsoleAppearance(rawValue:CommandLine.arguments[i+1]) }
+        if let i = CommandLine.arguments.firstIndex(of:"--preview-menu-style"), i+1 < CommandLine.arguments.count { testMenuAppearance = MenuAppearance(rawValue:CommandLine.arguments[i+1]) }
         buildPage(); updateStatus(); window.setContentSize(NSSize(width:760,height:700)); window.contentView?.layoutSubtreeIfNeeded()
         guard let i = CommandLine.arguments.firstIndex(of:"--render-preview"), i+1 < CommandLine.arguments.count, let windowView = window.contentView else { NSApp.terminate(nil); return }
         let view = CommandLine.arguments.contains("--preview-menu") ? menuView() : windowView
