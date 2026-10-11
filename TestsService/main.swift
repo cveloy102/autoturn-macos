@@ -21,9 +21,10 @@ var physical = PhysicalNetwork(interface:"en0",gateway:"192.168.1.1",service:"te
 final class RoutingFake: DomainRouting {
  var configured: RoutingSettings?, stops = 0, rejectStart = false, tunnelChecks = 0
  func configure(_ settings:RoutingSettings,physical:PhysicalNetwork) throws { configured = settings }
- func setTunnel(_ interface:String?,dns:[String]) throws {
+ func setTunnel(_ interface:String?,dns:[String],supportsIPv6:Bool) throws {
   tunnelChecks += 1
   check(protection.active,"Routing core started before protection")
+  check(!supportsIPv6,"IPv4-only profile advertised IPv6 to routing core")
   if rejectStart && configured?.mode == .rules { throw AppError.message("Test core failure") }
  }
  func stop() throws { stops += 1; configured = nil }

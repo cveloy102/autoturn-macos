@@ -143,6 +143,6 @@ protocol DomainRouting: AnyObject {
     func configure(_ settings: RoutingSettings, physical: PhysicalNetwork) throws
     func stop() throws
     func recoverJournal()
-    func setTunnel(_ interface: String?, dns: [String]) throws
+    func setTunnel(_ interface: String?, dns: [String], supportsIPv6: Bool) throws
 }
-extension DomainRouting { func setTunnel(_ interface: String?, dns: [String]) throws {} }
+extension DomainRouting { func setTunnel(_ interface: String?, dns: [String], supportsIPv6: Bool) throws {} }

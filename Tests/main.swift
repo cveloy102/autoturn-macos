@@ -167,4 +167,10 @@ expect(imported.rules == routes.rules,"Route import/export lost rules")
 let routeJSON = String(data:try JSONEncoder().encode(RoutingExport(routing:routes)),encoding:.utf8)!
 expect(!routeJSON.contains("privatekey") && !routeJSON.contains("profiles"),"Route export included VPN keys")
 expect(!RoutingPolicy.validSourcePath("../../secret") && RoutingPolicy.validSourcePath("source2/youtube.txt"),"Database source traversal allowed")
+let ipv4Core = try JSONSerialization.jsonObject(with:RoutingCoreConfiguration.make(routes,physicalInterface:"en0",gateway:"192.168.1.1",tunnel:"utun3",dns:"1.1.1.1")) as! [String:Any]
+let ipv4Inbounds = ipv4Core["inbounds"] as! [[String:Any]]
+expect(ipv4Inbounds[0]["address"] as? [String] == ["172.29.255.1/30"],"IPv4-only VPN falsely advertised IPv6 to Chrome")
+let dualCore = try JSONSerialization.jsonObject(with:RoutingCoreConfiguration.make(routes,physicalInterface:"en0",gateway:"192.168.1.1",tunnel:"utun3",dns:"1.1.1.1",supportsIPv6:true)) as! [String:Any]
+let dualInbounds = dualCore["inbounds"] as! [[String:Any]]
+expect((dualInbounds[0]["address"] as? [String])?.count == 2,"Dual-stack VPN lost IPv6 configuration")
 print("\(passed) total checks including migration, domain/CIDR precedence, route export and input validation.")

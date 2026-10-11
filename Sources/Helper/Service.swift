@@ -131,7 +131,7 @@ final class Service {
                 // Core liveness must not wait for the VPN health/backoff timer.
                 // Keep PF active while a crashed routing process is recreated.
                 if tunnel.running {
-                    try domainRoutes.setTunnel(tunnel.interface,dns:profile.dns)
+                    try domainRoutes.setTunnel(tunnel.interface,dns:profile.dns,supportsIPv6:profile.hasIPv6)
                     try guardManager.apply(tunnel:tunnel.interface,profile:profile)
                 }
                 status.guardActive = guardManager.active; return
@@ -142,7 +142,7 @@ final class Service {
                 do { try tunnel.start(profile, physical: physical, engine: installation.engine); try guardManager.apply(tunnel: tunnel.interface, profile: profile); saveGuard(); event("Туннель \(profile.name) создан") }
                 catch { event(error.localizedDescription); try tunnel.stop(); try guardManager.apply(tunnel: nil, profile: profile); connectionFailed(immediate: true); return }
             }
-            try domainRoutes.setTunnel(tunnel.interface,dns:profile.dns)
+            try domainRoutes.setTunnel(tunnel.interface,dns:profile.dns,supportsIPv6:profile.hasIPv6)
             try guardManager.apply(tunnel:tunnel.interface,profile:profile)
             status.tunnel = tunnel.interface; status.guardActive = guardManager.active
             if let iface = tunnel.interface, (healthCheck?(iface) ?? HealthProbe.check(tunnel:iface,dns:settings.routing.mode == .rules ? profile.dns : nil)) {

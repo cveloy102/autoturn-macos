@@ -163,6 +163,7 @@ final class Tunnel: ManagedTunnel {
         _ = try SystemCommand.checked("/sbin/ifconfig", [iface, "mtu", String(profile.mtu), "up"])
         if routingMode == .rules {
             _ = try SystemCommand.checked("/sbin/route",["-n","add","-ifscope",iface,"default","-interface",iface])
+            if profile.hasIPv6 { _ = try SystemCommand.checked("/sbin/route",["-n","add","-inet6","-ifscope",iface,"default","-interface",iface]) }
         } else {
         for route in ["0.0.0.0/1", "128.0.0.0/1"] { _ = try SystemCommand.checked("/sbin/route", ["-n", "add", "-net", route, "-interface", iface]); splitRoutes.append((false, route)) }
         if profile.hasIPv6 { for route in ["::/1", "8000::/1"] { _ = try SystemCommand.checked("/sbin/route", ["-n", "add", "-inet6", route, "-interface", iface]); splitRoutes.append((true, route)) } }
@@ -182,7 +183,10 @@ final class Tunnel: ManagedTunnel {
             if SCDynamicStoreCopyValue(store,key as CFString) != nil && !SCDynamicStoreRemoveValue(store, key as CFString) { errors.append("Не удалось убрать DNS AutoTurn") }
             else { dnsService = nil }
         }
-        if routingMode == .rules, let iface = interface { _ = try? SystemCommand.run("/sbin/route",["-n","delete","-ifscope",iface,"default","-interface",iface]) }
+        if routingMode == .rules, let iface = interface {
+            _ = try? SystemCommand.run("/sbin/route",["-n","delete","-ifscope",iface,"default","-interface",iface])
+            _ = try? SystemCommand.run("/sbin/route",["-n","delete","-inet6","-ifscope",iface,"default","-interface",iface])
+        }
         for (v6, route) in splitRoutes.reversed() {
             let result = try? SystemCommand.run("/sbin/route", ["-n", "delete"] + (v6 ? ["-inet6"] : []) + ["-net", route, "-interface", interface ?? ""])
             if result == nil { errors.append("Не удалось удалить маршрут AutoTurn") }

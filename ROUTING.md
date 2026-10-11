@@ -12,6 +12,16 @@ specific VPN rules take priority. Static IP rules are the fallback. Identified
 unlisted domains go direct; unknown opaque connections go through VPN. Browser
 DoH does not automatically expose destination names: readable TLS/QUIC names can
 be classified; ECH without a local DNS mapping conservatively stays in VPN.
+The presence of the ECH extension is treated as opaque, including GREASE:
+the outer server name alone cannot authorize direct egress. In live Chrome
+with Cloudflare DoH, this means even a direct Apple rule can remain in VPN
+and become unavailable when that VPN is down. This is a known limitation,
+not evidence that all direct rules work with every browser DNS setting.
+
+The routing TUN advertises IPv6 only when the AWG profile has an IPv6 address.
+Advertising IPv6 for an IPv4-only profile made Chrome choose endpoints that
+the VPN could not reach. Dual-stack profiles also receive a scoped IPv6 AWG
+route. Actual dual-stack traffic still needs a profile and a live test.
 
 DNS real-address cache follows DNS expiry, capped at six hours in the patched
 core. The earlier host-route cache prototype is not the active mechanism. Persistent fake addresses map

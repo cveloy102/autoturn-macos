@@ -21,10 +21,10 @@ final class RoutingCoreManager: DomainRouting {
         if self.settings.mode != settings.mode || (settings.mode == .rules && self.settings.rules != settings.rules) || self.physical.interface != physical.interface || self.physical.gateway != physical.gateway { try stop() }
         self.settings = settings; self.physical = physical
     }
-    func setTunnel(_ interface: String?, dns: [String]) throws {
+    func setTunnel(_ interface: String?, dns: [String], supportsIPv6: Bool) throws {
         guard settings.mode == .rules else { return }
         guard let tunnel = interface, let physical = physical.interface, let gateway = self.physical.gateway, let server = dns.first else { throw AppError.message("Туннель ещё не готов для маршрутов") }
-        let data = try RoutingCoreConfiguration.make(settings,physicalInterface:physical,gateway:gateway,tunnel:tunnel,dns:server)
+        let data = try RoutingCoreConfiguration.make(settings,physicalInterface:physical,gateway:gateway,tunnel:tunnel,dns:server,supportsIPv6:supportsIPv6)
         let fingerprint = String(data:data,encoding:.utf8)!
         if self.fingerprint == fingerprint && process?.isRunning == true { return }
         try stopProcess()
