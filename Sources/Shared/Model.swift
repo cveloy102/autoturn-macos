@@ -119,9 +119,22 @@ struct Settings: Codable {
     var profiles: [Profile] = []
     var selectedID: String?
     var launchAtLogin: Bool = false
+    var routing = RoutingSettings()
+    init() {}
+    enum CodingKeys: String, CodingKey { case mode, homeSSIDs, profiles, selectedID, launchAtLogin, routing }
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy:CodingKeys.self)
+        mode = try c.decodeIfPresent(Mode.self,forKey:.mode) ?? .auto
+        homeSSIDs = try c.decodeIfPresent([String].self,forKey:.homeSSIDs) ?? []
+        profiles = try c.decodeIfPresent([Profile].self,forKey:.profiles) ?? []
+        selectedID = try c.decodeIfPresent(String.self,forKey:.selectedID)
+        launchAtLogin = try c.decodeIfPresent(Bool.self,forKey:.launchAtLogin) ?? false
+        routing = try c.decodeIfPresent(RoutingSettings.self,forKey:.routing) ?? RoutingSettings()
+    }
 }
 struct NetworkObservation: Codable { var available: Bool; var interface: String?; var ssid: String?; var gateway: String? }
 struct ServiceStatus: Codable {
+    var routingProtocol: Int? = 2
     var phase: Phase = .setup
     var mode: Mode = .auto
     var profileID: String?

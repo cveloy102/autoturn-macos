@@ -7,3 +7,4 @@ work-engine-*/
 *.private
 *.pem
 secrets/
+third_party/routing-core/

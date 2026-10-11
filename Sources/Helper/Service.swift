@@ -10,8 +10,9 @@ final class Service {
     let queue = DispatchQueue(label: "ru.hl100.autoturn.service")
     let guardManager: TrafficProtection
     let tunnel: ManagedTunnel
+    let domainRoutes: DomainRouting
     let physicalRead: () -> PhysicalNetwork
-    let healthCheck: (String) -> Bool
+    let healthCheck: ((String) -> Bool)?
     let stateDirectory: String
     var settings = Settings(), status = ServiceStatus()
     var observation = NetworkObservation(available: false, interface: nil, ssid: nil, gateway: nil)
@@ -23,15 +24,15 @@ final class Service {
     let installation: Installation
     let timer: DispatchSourceTimer
     let monitor = NWPathMonitor()
-    init(_ installation: Installation, protection: TrafficProtection = TrafficGuard(), managedTunnel: ManagedTunnel = Tunnel(), physical: @escaping () -> PhysicalNetwork = PhysicalNetwork.read, health: @escaping (String) -> Bool = HealthProbe.check, stateDirectory: String = support, monitoring: Bool = true) {
-        self.installation = installation; guardManager = protection; tunnel = managedTunnel; physicalRead = physical; healthCheck = health; self.stateDirectory = stateDirectory
+    init(_ installation: Installation, protection: TrafficProtection = TrafficGuard(), managedTunnel: ManagedTunnel = Tunnel(), routing: DomainRouting? = nil, physical: @escaping () -> PhysicalNetwork = PhysicalNetwork.read, health: ((String) -> Bool)? = nil, stateDirectory: String = support, monitoring: Bool = true) {
+        self.installation = installation; domainRoutes = routing ?? RoutingCoreManager(protection:protection,directory:stateDirectory); guardManager = protection; tunnel = managedTunnel; physicalRead = physical; healthCheck = health; self.stateDirectory = stateDirectory
         observedPhysical = physical()
         timer = DispatchSource.makeTimerSource(queue: queue)
         if let saved = try? JSONDecoder().decode(SavedGuard.self, from: Data(contentsOf: URL(fileURLWithPath: stateDirectory + "/guard.json"))) {
             guardRequired = saved.required; guardManager.restoreToken(saved.token)
         }
         if guardRequired { do { try guardManager.apply(tunnel:nil,profile:nil); saveGuard() } catch { status.phase = .error; status.message = "Не удалось восстановить блокировку после перезапуска" } }
-        tunnel.recoverJournal()
+        domainRoutes.recoverJournal(); tunnel.recoverJournal()
         timer.schedule(deadline: monitoring ? .now() : .now() + 3600, repeating: monitoring ? 5 : 3600)
         timer.setEventHandler { [weak self] in self?.tick() }; timer.resume()
         monitor.pathUpdateHandler = { [weak self] _ in guard let self = self else { return }; self.queue.async { self.physicalNetworkChanged() } }
@@ -53,10 +54,12 @@ final class Service {
             case "status": break
             case "configure":
                 guard var value = request.settings, value.profiles.count <= 32, value.homeSSIDs.count <= 32, value.homeSSIDs.allSatisfy({ !$0.isEmpty && $0.utf8.count <= 32 }) else { throw AppError.message("Некорректные настройки") }
+                value.routing = try value.routing.validated()
+                guard (try JSONEncoder().encode(value)).count < 900000 else { throw AppError.message("Настройки слишком большие") }
                 value.profiles = try value.profiles.map { try $0.validated() }
                 guard Set(value.profiles.map { $0.id }).count == value.profiles.count else { throw AppError.message("Повторные профили") }
                 if value.mode != .off && value.profiles.isEmpty { throw AppError.message("Сначала импортируй профиль") }
-                let changed = value.profiles != settings.profiles || value.selectedID != settings.selectedID
+                let changed = value.profiles != settings.profiles || value.selectedID != settings.selectedID || value.routing.mode != settings.routing.mode || (value.routing.mode == .rules && value.routing.rules != settings.routing.rules)
                 settings = value
                 if let network = request.network { recordNetwork(network) }
                 if changed { index = value.profiles.firstIndex { $0.id == value.selectedID } ?? 0; pendingTunnelReset = true }
@@ -100,6 +103,7 @@ final class Service {
                     // Once direct Internet is requested, release PF before stopping
                     // the engine so a slow process exit cannot leave the user blocked.
                     do { try guardManager.remove() } catch { cleanupError = error }
+                    do { try domainRoutes.stop() } catch { if cleanupError == nil { cleanupError = error } }
                     do { try tunnel.stop() } catch { if cleanupError == nil { cleanupError = error } }
                     guardRequired = guardManager.active; saveGuard(); event("Наш VPN отключён")
                 }
@@ -110,13 +114,17 @@ final class Service {
                 return
             }
             guardRequired = true; saveGuard()
-            if (changed || pendingTunnelReset) && tunnel.running { try guardManager.apply(tunnel: nil, profile: nil); try tunnel.stop(); event("Пересоздаём туннель после изменения сети или профиля") }
+            if (changed || pendingTunnelReset) && tunnel.running { try domainRoutes.stop(); try guardManager.configureRouting(RoutingSettings(),physical:physical); try guardManager.apply(tunnel: nil, profile: nil); try tunnel.stop(); event("Пересоздаём туннель после изменения сети или профиля") }
             pendingTunnelReset = false
             if !network.available || settings.profiles.isEmpty {
                 try guardManager.apply(tunnel: tunnel.running ? tunnel.interface : nil, profile: nil); saveGuard()
                 status.phase = .waiting; status.message = settings.profiles.isEmpty ? "Ожидаем профили от приложения. Прямой доступ закрыт." : "Ждём сеть. Режим VPN сохранён."; status.guardActive = guardManager.active; status.verifiedAt = nil; return
             }
             let profile = settings.profiles[index % settings.profiles.count]
+            if !tunnel.running { try guardManager.configureRouting(RoutingSettings(),physical:physical); try guardManager.apply(tunnel:nil,profile:profile); saveGuard() }
+            try domainRoutes.configure(settings.routing,physical:physical)
+            try guardManager.configureRouting(settings.routing,physical:physical)
+            tunnel.setRoutingMode(settings.routing.mode)
             status.profileID = profile.id; status.profileName = profile.name
             if tunnel.running { try guardManager.apply(tunnel: tunnel.interface, profile: profile); saveGuard() }
             if Date() < nextCheck { status.guardActive = guardManager.active; return }
@@ -126,21 +134,24 @@ final class Service {
                 do { try tunnel.start(profile, physical: physical, engine: installation.engine); try guardManager.apply(tunnel: tunnel.interface, profile: profile); saveGuard(); event("Туннель \(profile.name) создан") }
                 catch { event(error.localizedDescription); try tunnel.stop(); try guardManager.apply(tunnel: nil, profile: profile); connectionFailed(immediate: true); return }
             }
+            try domainRoutes.setTunnel(tunnel.interface,dns:profile.dns)
+            try guardManager.apply(tunnel:tunnel.interface,profile:profile)
             status.tunnel = tunnel.interface; status.guardActive = guardManager.active
-            if let iface = tunnel.interface, healthCheck(iface) {
+            if let iface = tunnel.interface, (healthCheck?(iface) ?? HealthProbe.check(tunnel:iface,dns:settings.routing.mode == .rules ? profile.dns : nil)) {
                 let wasConnected = status.phase == .connected
-                status.phase = .connected; status.message = "VPN подключён · трафик проверен"; status.verifiedAt = Date()
+                status.phase = .connected; status.message = settings.routing.mode == .rules ? "VPN подключён · маршруты по доменам" : "VPN подключён · трафик проверен"; status.verifiedAt = Date()
                 failures = 0; attempted = 0; round = 0; nextCheck = Date().addingTimeInterval(30)
                 if !wasConnected { event("\(profile.name): доступ через VPN подтверждён") }
             } else { connectionFailed(immediate: false) }
         } catch {
+            if settings.routing.mode == .rules { try? guardManager.configureRouting(RoutingSettings(),physical:physical); try? guardManager.apply(tunnel:tunnel.interface,profile:settings.profiles.isEmpty ? nil : settings.profiles[index % settings.profiles.count]); saveGuard() }
             status.phase = .error; status.message = error.localizedDescription; status.guardActive = guardManager.active; status.verifiedAt = nil
             nextCheck = Date().addingTimeInterval(30); event(status.message)
         }
     }
     private func connectionFailed(immediate: Bool) {
         failures += immediate ? 3 : 1
-        status.phase = .recovering; status.verifiedAt = nil; status.message = "Связь не подтверждена. Прямой доступ закрыт."
+        status.phase = .recovering; status.verifiedAt = nil; status.message = settings.routing.mode == .rules ? "VPN восстанавливается. Выбранные сервисы закрыты; прямые работают." : "Связь не подтверждена. Прямой доступ закрыт."
         status.guardActive = guardManager.active
         guard failures >= 3 else { nextCheck = Date().addingTimeInterval(10); return }
         failures = 0; attempted += 1

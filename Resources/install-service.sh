@@ -32,9 +32,11 @@ done
 /bin/launchctl bootout "system/$LABEL" >/dev/null 2>&1 || true
 /bin/cp "$STAGE/Contents/Library/LaunchServices/AutoTurnHelper" "$SUPPORT/AutoTurnHelper.new"
 /bin/cp "$STAGE/Contents/Resources/amneziawg-go" "$SUPPORT/amneziawg-go.new"
-/bin/chmod 755 "$SUPPORT/AutoTurnHelper.new" "$SUPPORT/amneziawg-go.new"
+/bin/cp "$STAGE/Contents/Resources/routing-core" "$SUPPORT/routing-core.new"
+/bin/chmod 755 "$SUPPORT/AutoTurnHelper.new" "$SUPPORT/amneziawg-go.new" "$SUPPORT/routing-core.new"
 /bin/mv -f "$SUPPORT/AutoTurnHelper.new" "$SUPPORT/AutoTurnHelper"
 /bin/mv -f "$SUPPORT/amneziawg-go.new" "$SUPPORT/amneziawg-go"
+/bin/mv -f "$SUPPORT/routing-core.new" "$SUPPORT/routing-core"
 cat > "$SUPPORT/installation.json.new" <<EOF
 {"uid":$OWNER_UID,"cdhashes":[$HASHES],"engine":"/Library/Application Support/AutoTurn/amneziawg-go"}
 EOF

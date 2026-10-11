@@ -145,3 +145,26 @@ expect(!LoginRegistration.existing(in:loginTestDirectory),"explicit login Off wa
 try LoginRegistration.set(false,in:loginTestDirectory)
 expect(!FileManager.default.fileExists(atPath:loginFile.path),"login Off is not idempotent")
 print("\(passed) checks passed: AWG 3.1 parser, full tunnel, home policy, failover order, retries, update signatures, downgrade/host/OS rejection")
+
+let legacySettings = try JSONDecoder().decode(Settings.self,from:Data("{\"mode\":\"off\",\"homeSSIDs\":[\"Keen_5G\"],\"profiles\":[],\"launchAtLogin\":true}".utf8))
+expect(legacySettings.mode == .off && legacySettings.homeSSIDs == ["Keen_5G"] && legacySettings.launchAtLogin && legacySettings.routing.mode == .all,"Routing migration reset user settings")
+var routes = RoutingSettings(); routes.mode = .rules
+routes.rules = [RoutingRule(name:"YouTube",domains:["youtube.com","googlevideo.com"]),RoutingRule(name:"Specific direct",domains:["help.youtube.com"],destination:.direct)]
+expect(RoutingPolicy.destination(for:"r1.googlevideo.com",settings:routes) == .vpn,"Subdomain not matched")
+expect(RoutingPolicy.destination(for:"notyoutube.com",settings:routes) == .direct,"Domain suffix crossed label boundary")
+expect(RoutingPolicy.destination(for:"help.youtube.com",settings:routes) == .direct,"Specific direct rule ignored")
+routes.rules.append(RoutingRule(name:"Safe tie",domains:["help.youtube.com"]))
+expect(RoutingPolicy.destination(for:"help.youtube.com",settings:routes) == .vpn,"Equal rule conflict leaked VPN domain")
+expect(RoutingPolicy.contains("192.0.2.12",cidr:"192.0.2.0/24") && !RoutingPolicy.contains("192.0.3.12",cidr:"192.0.2.0/24"),"IPv4 subnet matching wrong")
+expect(RoutingPolicy.contains("2001:db8::1",cidr:"2001:db8::/32") && !RoutingPolicy.contains("2001:db9::1",cidr:"2001:db8::/32"),"IPv6 subnet matching wrong")
+for invalid in ["https://youtube.com/path","evil.example; pass all","a..example","127.0.0.1","-bad.example"] {
+ do { _ = try RoutingPolicy.normalizeDomain(invalid); fatalError("Invalid domain accepted") } catch { passed += 1 }
+}
+let normalizedDomain = try RoutingPolicy.normalizeDomain("*.Example.COM.")
+expect(normalizedDomain == "example.com","Domain normalization wrong")
+let imported = try RoutingExport.read(JSONEncoder().encode(RoutingExport(routing:routes)))
+expect(imported.rules == routes.rules,"Route import/export lost rules")
+let routeJSON = String(data:try JSONEncoder().encode(RoutingExport(routing:routes)),encoding:.utf8)!
+expect(!routeJSON.contains("privatekey") && !routeJSON.contains("profiles"),"Route export included VPN keys")
+expect(!RoutingPolicy.validSourcePath("../../secret") && RoutingPolicy.validSourcePath("source2/youtube.txt"),"Database source traversal allowed")
+print("\(passed) total checks including migration, domain/CIDR precedence, route export and input validation.")

@@ -7,7 +7,7 @@ enum IPC {
     static func connect(_ path: String) throws -> Int32 {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { throw AppError.message("Не удалось создать сокет") }
-        var timeout = timeval(tv_sec: 20, tv_usec: 0)
+        var timeout = timeval(tv_sec: 40, tv_usec: 0)
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
         var noSignal: Int32 = 1; setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSignal, 4)

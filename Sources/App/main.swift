@@ -166,9 +166,18 @@ final class ConsoleSurface: NSView {
 
 final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNotificationCenterDelegate {
     var settings = Settings(), status = ServiceStatus()
-    var serviceAvailable = false, busy = false, checkingUpdate = false, polling = false
+    var serviceAvailable = false, busy = false, checkingConnection = false, checkingUpdate = false, polling = false
     var window: NSWindow!, body = NSView(), page = NSStackView(), footer: NSTextField!
     var tab = "Соединение"
+    let routingDatabase = RoutingDatabase()
+    var routingSelectedID: String?, routingQuery = "", routingFeedback = ""
+    var routingBusy = false
+    var routingTimer: Timer?
+    var routingList: NSStackView?
+    var routingSearch: NSSearchField?
+    var routingStatusLabel: NSTextField?
+    var testRoutingAppearance: RoutingAppearance?
+    var routingAppearance: RoutingAppearance { testRoutingAppearance ?? RoutingAppearance(rawValue:UserDefaults.standard.string(forKey:"appearance.routing") ?? "") ?? .console }
     var testConsoleAppearance: ConsoleAppearance?
     var consoleAppearance: ConsoleAppearance { testConsoleAppearance ?? ConsoleAppearance(rawValue:UserDefaults.standard.string(forKey:"appearance.console") ?? "") ?? .console }
     var testMenuAppearance: MenuAppearance?
@@ -215,7 +224,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
         RunLoop.main.add(timer!,forMode:.common)
         if !CommandLine.arguments.contains("--background") { openWindow() }
         if liveNetworkTest { beginLiveNetworkTest() }
-        else { setupAutomaticUpdates() }
+        else { setupAutomaticUpdates(); setupRoutingUpdates() }
     }
     func buildWindow() {
         window = NSWindow(contentRect:NSRect(x:0,y:0,width:760,height:700),styleMask:[.titled,.closable,.miniaturizable,.resizable],backing:.buffered,defer:false)
@@ -246,9 +255,9 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
         nav.orientation = sidebar ? .vertical : .horizontal
         nav.alignment = sidebar ? .leading : .centerY
         nav.arrangedSubviews.forEach { nav.removeArrangedSubview($0); $0.removeFromSuperview() }
-        for name in ["Соединение","Профили","Домашняя сеть","События","Настройки"] {
+        for name in ["Соединение","Профили","Маршруты","Домашняя сеть","События","Настройки"] {
             let button = ActionButton(name == "Профили" ? "Профили \(settings.profiles.count)" : name == "Домашняя сеть" ? "Дом" : name,primary:tab == name) { [weak self] in self?.selectTab(name) }
-            button.tabStyle = true; if sidebar { button.widthAnchor.constraint(equalToConstant:158).isActive = true }; button.font = NSFont.monospacedSystemFont(ofSize:11,weight:.regular); nav.addArrangedSubview(button)
+            button.tabStyle = true; if sidebar { button.widthAnchor.constraint(equalToConstant:158).isActive = true }; button.font = NSFont.monospacedSystemFont(ofSize:10,weight:.regular); nav.addArrangedSubview(button)
         }
         nav.addArrangedSubview(NSView())
         if let release = updater.candidate {
@@ -272,6 +281,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
         consoleProfileButtons = []; consoleEventsField = nil; connectionCheckField = nil
         connectionTitle = nil; connectionMessage = nil; connectionNetwork = nil; connectionProfile = nil; connectionGuard = nil
         switch tab {
+        case "Маршруты": routingPage()
         case "Профили": profilesPage()
         case "Домашняя сеть": homePage()
         case "События": eventsPage()
@@ -302,7 +312,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
             pin(hero,inside:card,inset:18); left.addArrangedSubview(card); card.widthAnchor.constraint(equalTo:left.widthAnchor).isActive = true
         } else { left.addArrangedSubview(hero); hero.widthAnchor.constraint(equalTo:left.widthAnchor).isActive = true }
         connectionNetwork = label(status.network,size:11); connectionProfile = label(status.profileName ?? selectedProfile()?.name ?? "не выбран",size:11)
-        connectionGuard = label(status.guardActive ? "Заблокирован" : "Разрешён",size:11,color:Palette.dim)
+        connectionGuard = label(status.guardActive ? (settings.routing.mode == .rules ? "По правилам" : "Заблокирован") : "Разрешён",size:11,color:Palette.dim)
         connectionCheckField = label(verificationDescription(),size:11)
         let facts = stack(spacing:18)
         func cell(_ name:String,_ value:NSTextField) -> NSStackView {
@@ -314,7 +324,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
             facts.addArrangedSubview(row); row.widthAnchor.constraint(equalTo:facts.widthAnchor).isActive = true
         }
         left.addArrangedSubview(facts); facts.widthAnchor.constraint(equalTo:left.widthAnchor).isActive = true
-        let check = ActionButton("Проверить связь",primary:true) { [weak self] in self?.command("check") }; check.isEnabled = serviceAvailable
+        let check = ActionButton(checkingConnection ? "Проверяем HTTPS…" : "Проверить связь",primary:true) { [weak self] in self?.command("check") }; check.isEnabled = serviceAvailable && !checkingConnection
         let next = ActionButton("Следующий профиль ↗") { [weak self] in self?.command("next") }; next.isEnabled = serviceAvailable && settings.profiles.count > 1
         check.font = NSFont.monospacedSystemFont(ofSize:11,weight:.regular); next.font = check.font
         let actions = narrow ? stack([check,next],spacing:8) : stack([check,next],vertical:false,spacing:8)
@@ -409,6 +419,12 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
             })
         }
         page.addArrangedSubview(consoles)
+        page.addArrangedSubview(label("ОФОРМЛЕНИЕ МАРШРУТОВ",size:11,color:Palette.dim))
+        let routeThemes = stack(vertical:consoleAppearance == .workspace,spacing:8)
+        for style in RoutingAppearance.allCases {
+            routeThemes.addArrangedSubview(ActionButton(style.title,primary:routingAppearance == style) { [weak self] in UserDefaults.standard.set(style.rawValue,forKey:"appearance.routing"); self?.buildPage() })
+        }
+        page.addArrangedSubview(routeThemes)
         page.addArrangedSubview(line())
         page.addArrangedSubview(label("ОБНОВЛЕНИЯ / GITHUB",size:11,color:Palette.dim))
         page.addArrangedSubview(label("Проверяем раз в час, пока AutoTurn запущен. После сна — при пробуждении. Уведомление приходит только для новой версии.",color:Palette.dim))
@@ -427,6 +443,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
     func showMoreMenu() {
         let menu = NSMenu()
         func add(_ title:String,_ action:@escaping () -> Void) { menu.addItem(ClosureMenuItem(title,action:action)) }
+        add("Маршруты…") { [weak self] in self?.tab = "Маршруты"; self?.openWindow() }
         add("Настройки…") { [weak self] in self?.tab = "Настройки"; self?.openWindow() }
         add("Домашние сети…") { [weak self] in self?.tab = "Домашняя сеть"; self?.openWindow() }
         add("+ Добавить профиль…") { [weak self] in self?.openWindow(); self?.importProfile() }
@@ -538,8 +555,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
         if settings.profiles.isEmpty { row("+ Добавить профиль…") { [weak self] in self?.importProfile() } }
         else if style == .card || settings.profiles.count > 3 { row("Все профили…") { [weak self] in self?.tab = "Профили"; self?.openWindow() } }
         y += 12
-        let check = ActionButton("Проверить связь",primary:style == .calm) { [weak self] in self?.command("check") }
-        check.cornerRadius = style == .instrument ? 2 : 7; check.isEnabled = serviceAvailable; place(check,36,20,246)
+        let check = ActionButton(checkingConnection ? "Проверяем HTTPS…" : "Проверить связь",primary:style == .calm) { [weak self] in self?.command("check") }
+        check.cornerRadius = style == .instrument ? 2 : 7; check.isEnabled = serviceAvailable && !checkingConnection; place(check,36,20,246)
         let next = ActionButton("→") { [weak self] in self?.command("next") }; next.toolTip = "Следующий профиль"; next.isEnabled = serviceAvailable && settings.profiles.count > 1; next.cornerRadius = check.cornerRadius; place(next,36,274,38); y += 50
         if needsLocationPermission() { row("Разрешить определение Wi-Fi…") { [weak self] in self?.observer.requestPermission() } }
         if let release = updater.candidate {
@@ -556,7 +573,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
         view.frame.size.height = y; return view
     }
     func menuRevision() -> String {
-        ([settings.mode.rawValue,status.phase.rawValue,connectionDescription(),status.network,status.profileID ?? "",settings.selectedID ?? "",String(status.guardActive),String(serviceAvailable),String(updater.candidate?.build ?? 0),menuAppearance.rawValue,status.verifiedAt.map { String($0.timeIntervalSince1970) } ?? ""] + settings.profiles.map { $0.id + $0.name }).joined(separator:"\u{1f}")
+        ([settings.mode.rawValue,settings.routing.mode.rawValue,status.phase.rawValue,connectionDescription(),status.network,status.profileID ?? "",settings.selectedID ?? "",String(status.guardActive),String(serviceAvailable),String(checkingConnection),String(updater.candidate?.build ?? 0),menuAppearance.rawValue,status.verifiedAt.map { String($0.timeIntervalSince1970) } ?? ""] + settings.profiles.map { $0.id + $0.name }).joined(separator:"\u{1f}")
     }
     func refreshOpenMenu() {
         guard popover.isShown, renderedMenuRevision != menuRevision() else { return }
@@ -601,6 +618,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
     }
     func titleForStatus() -> String { switch status.phase { case .setup:return "Начнём с профиля_"; case .home:return "Ты дома_"; case .connecting:return "Проверяем связь_"; case .connected:return "Под защитой_"; case .waiting:return "Ждём сеть_"; case .recovering:return "Восстанавливаем_"; case .off:return "Выключено вручную_"; case .error:return "Нужно внимание_" } }
     func verificationDescription() -> String {
+        if checkingConnection { return "Проверяем HTTPS через VPN…" }
         if status.phase == .home { return "VPN не требуется" }
         if let date = status.verifiedAt {
             let formatter = DateFormatter(); formatter.dateFormat = "HH:mm:ss"
@@ -608,13 +626,13 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
         }
         return "Не подтверждена"
     }
-    func guardDescription() -> String { if !serviceAvailable { return FileManager.default.fileExists(atPath:"/Library/LaunchDaemons/ru.hl100.autoturn.helper.plist") ? "Состояние службы и блокировки не подтверждено" : "VPN-служба ещё не установлена; интернет не изменён" }; return status.guardActive ? "Прямой трафик заблокирован" : "Блокировка прямого доступа выключена" }
+    func guardDescription() -> String { if !serviceAvailable { return FileManager.default.fileExists(atPath:"/Library/LaunchDaemons/ru.hl100.autoturn.helper.plist") ? "Состояние службы и блокировки не подтверждено" : "VPN-служба ещё не установлена; интернет не изменён" }; return status.guardActive && settings.routing.mode == .rules ? "Прямой доступ по правилам; выбранные сервисы защищены" : status.guardActive ? "Прямой трафик заблокирован" : "Блокировка прямого доступа выключена" }
     func selectedProfile() -> Profile? { settings.profiles.first { $0.id == settings.selectedID } ?? settings.profiles.first }
     func updateStatus() {
         let revision = menuRevision() + consoleAppearance.rawValue + (status.profileName ?? "") + status.events.suffix(2).joined(separator:"\n")
         guard renderedStatusRevision != revision else { return }
         renderedStatusRevision = revision
-        if let title = connectionTitle { paintHeading(title,titleForStatus()); if consoleAppearance == .contrast { title.textColor = Palette.bg; title.attributedStringValue = NSAttributedString(string:titleForStatus(),attributes:[.font:title.font!,.foregroundColor:Palette.bg]) } }; connectionMessage?.stringValue = connectionDescription(); connectionNetwork?.stringValue = status.network; connectionProfile?.stringValue = status.profileName ?? selectedProfile()?.name ?? "не выбран"; connectionGuard?.stringValue = status.guardActive ? "Заблокирован" : "Разрешён"; connectionCheckField?.stringValue = verificationDescription(); connectionGuard?.textColor = status.guardActive ? Palette.green : Palette.dim
+        if let title = connectionTitle { paintHeading(title,titleForStatus()); if consoleAppearance == .contrast { title.textColor = Palette.bg; title.attributedStringValue = NSAttributedString(string:titleForStatus(),attributes:[.font:title.font!,.foregroundColor:Palette.bg]) } }; connectionMessage?.stringValue = connectionDescription(); connectionNetwork?.stringValue = status.network; connectionProfile?.stringValue = status.profileName ?? selectedProfile()?.name ?? "не выбран"; connectionGuard?.stringValue = status.guardActive ? (settings.routing.mode == .rules ? "По правилам" : "Заблокирован") : "Разрешён"; connectionCheckField?.stringValue = verificationDescription(); connectionGuard?.textColor = status.guardActive ? Palette.green : Palette.dim
         for (profile,button) in consoleProfileButtons {
             button.primary = profile.id == (status.profileID ?? settings.selectedID)
             button.profileState = button.primary ? (status.phase == .connected ? "активен" : status.phase == .home || status.phase == .off ? "готов" : "проверка") : "резерв"
@@ -641,7 +659,34 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
         switch result { case .success(let response):serviceAvailable = true; status = response.status; if !response.ok && !quiet { showError(AppError.message(response.error ?? "Ошибка службы")) }; case .failure(let error):serviceAvailable = false; status.phase = .setup; status.message = FileManager.default.fileExists(atPath:"/Library/LaunchDaemons/ru.hl100.autoturn.helper.plist") ? "Служба недоступна. Её состояние и блокировку сейчас подтвердить нельзя." : "Импортируй AmneziaWG .conf и установи VPN-службу"; if !quiet { showError(error) } }
         updateStatus()
     }
-    func command(_ command: String) { guard serviceAvailable else { showError(AppError.message("Сначала импортируй профиль и установи VPN-службу")); return }; busy = true; client.send(RPCRequest(command:command,settings:nil,network:nil)) { [weak self] result in self?.busy = false; self?.accept(result) } }
+    func command(_ command: String) {
+        guard !busy else { return }
+        guard serviceAvailable else { showError(AppError.message("Сначала импортируй профиль и установи VPN-службу")); return }
+        if command == "check" {
+            if status.phase == .home || status.phase == .off {
+                info(status.phase == .home ? "Ты в домашней сети: VPN не используется. Эта кнопка проверяет доступ в интернет через VPN; домашнее подключение она сейчас не проверяет." : "VPN выключен вручную. Эта кнопка проверяет доступ в интернет через VPN; прямое подключение она сейчас не проверяет.")
+                return
+            }
+            checkingConnection = true
+        }
+        busy = true
+        if command == "check" { buildPage(); refreshOpenMenu() }
+        let startedAt = Date()
+        client.send(RPCRequest(command:command,settings:nil,network:nil)) { [weak self] result in
+            guard let self = self else { return }
+            self.busy = false; self.checkingConnection = false; self.accept(result)
+            if command == "check" {
+                self.buildPage(); self.refreshOpenMenu()
+                if case .success(let response) = result, response.ok {
+                    if response.status.phase == .connected, let verified = response.status.verifiedAt, verified >= startedAt {
+                        self.info("Доступ в интернет через VPN подтверждён HTTPS-запросом. " + self.verificationDescription())
+                    } else {
+                        self.info("Проверка завершена: " + response.status.message)
+                    }
+                }
+            }
+        }
+    }
     func persistAndConfigure() {
         do { try Storage.save(settings) } catch { showError(error); return }
         buildPage()
@@ -679,7 +724,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
     }
     func removeProfile(_ profile: Profile) { guard confirm("Удалить \(profile.name)?",detail:"Профиль будет удалён из Keychain приложения.") else { return }; settings.profiles.removeAll { $0.id == profile.id }; if settings.selectedID == profile.id { settings.selectedID = settings.profiles.first?.id }; if settings.profiles.isEmpty { settings.mode = .off }; persistAndConfigure() }
     @objc func toggleLogin(_ sender: NSButton) { do { try Storage.setLaunchAtLogin(sender.state == .on); settings.launchAtLogin = sender.state == .on; try Storage.save(settings) } catch { sender.state = settings.launchAtLogin ? .on : .off; showError(error) } }
-    @objc func woke() { observer.report(); refresh(); checkAutomaticUpdates() }
+    @objc func woke() { observer.report(); refresh(); checkAutomaticUpdates(); checkRoutingUpdates() }
     func installService() {
         guard !settings.profiles.isEmpty else { tab = "Профили"; openWindow(); return }
         guard confirm("Установить VPN-службу AutoTurn?",detail:"Служба получит права администратора для нашего туннеля, DNS и блокировки прямого трафика. После установки начнёт работать выбранный режим. Это тестовая сборка: подготовь возможность отключить VPN через меню.") else { return }
@@ -859,7 +904,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
             settings.profiles = profiles
             for width in [CGFloat(700),760,1000] {
                 window.setContentSize(NSSize(width:width,height:700))
-                for name in ["Соединение","Профили","Домашняя сеть","События","Настройки"] {
+                for name in ["Соединение","Профили","Маршруты","Домашняя сеть","События","Настройки"] {
                     tab = name; buildPage(); window.contentView?.layoutSubtreeIfNeeded()
                     require(abs(window.contentView!.bounds.width-width)<1,"window width changed")
                     require(body.bounds.width == width-48,"content margins")
@@ -884,6 +929,14 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
             let mark = menu.subviews.compactMap { $0 as? NSTextField }.first { $0.stringValue == "HL100" }
             require(mark != nil && mark!.frame.width >= mark!.intrinsicContentSize.width,"HL100 label clipped")
         }
+        checkingConnection = true
+        tab = "Соединение"; buildPage()
+        require(buttons(body).contains { $0.title == "Проверяем HTTPS…" && !$0.isEnabled },"console check must show progress and prevent repeats")
+        for appearance in MenuAppearance.allCases {
+            testMenuAppearance = appearance
+            require(buttons(menuView()).contains { $0.title == "Проверяем HTTPS…" && !$0.isEnabled },"menu check must show progress and prevent repeats")
+        }
+        checkingConnection = false; testMenuAppearance = nil
         let mockRelease = MacRelease(version:"9.9.9",build:999,minimumOS:"13.0",archiveURL:"",sha256:"",signature:"",notes:"")
         updater.candidate = mockRelease
         for appearance in MenuAppearance.allCases {
@@ -903,7 +956,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
             testConsoleAppearance = appearance
             for width in [CGFloat(700),760] {
                 window.setContentSize(NSSize(width:width,height:700))
-                for name in ["Соединение","Профили","Домашняя сеть","События","Настройки"] {
+                for name in ["Соединение","Профили","Маршруты","Домашняя сеть","События","Настройки"] {
                     tab = name; buildPage(); window.contentView?.layoutSubtreeIfNeeded()
                     require(abs(window.contentView!.bounds.width-width)<1,"theme changed window size")
                     for button in buttons(body) {
@@ -912,11 +965,24 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
                         require(frame.minX >= -1 && frame.maxX <= body.bounds.width+1,"theme action exceeds content width")
                     }
                     if name == "Соединение" { require(buttons(body).contains { $0.title == "Проверить связь" },"console theme lost check action") }
-                    if name == "Настройки" { require(buttons(body).filter { ConsoleAppearance.allCases.map(\.title).contains($0.title) }.count == 3,"console themes missing") }
+                    if name == "Настройки" { require(Set(buttons(body).map { $0.title }).isSuperset(of:ConsoleAppearance.allCases.map(\.title)),"console themes missing") }
                 }
             }
         }
         testConsoleAppearance = nil
+        require(RoutingDatabase.validCatalog(routingDatabase.snapshot.catalog),"bundled route catalog invalid")
+        settings.routing.mode = .rules
+        settings.routing.rules = [RoutingRule(name:"YouTube",serviceID:"youtube",sourcePath:"source2/youtube.txt",baseDomains:["youtube.com","googlevideo.com","ytimg.com"]),RoutingRule(name:"Свой сервер",domains:["panel.hl100.ru"],destination:.direct)]
+        for appearance in RoutingAppearance.allCases {
+            testRoutingAppearance = appearance
+            for width in [CGFloat(700),760] {
+                window.setContentSize(NSSize(width:width,height:700)); tab = "Маршруты"; buildPage(); window.contentView?.layoutSubtreeIfNeeded()
+                require(buttons(body).contains { $0.title == "Обновить базы" },"route database action missing")
+                require(buttons(body).contains { $0.title == "Импорт" } && buttons(body).contains { $0.title == "Экспорт" },"route import/export missing")
+                for button in buttons(body) { let frame = button.convert(button.bounds,to:body); require(frame.minX >= -1 && frame.maxX <= body.bounds.width+1,"route theme action exceeds content width") }
+            }
+        }
+        testRoutingAppearance = nil; settings.routing = RoutingSettings()
         tab = "Настройки"; buildPage(); window.contentView?.layoutSubtreeIfNeeded()
         require(buttons(body).filter { MenuAppearance.allCases.map(\.title).contains($0.title) }.count == 3,"appearance choices missing")
         require(buttons(body).contains { $0.title == "● Обновить до 9.9.9" },"settings update missing")
@@ -984,6 +1050,12 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
             status = ServiceStatus(phase:.connected,mode:.auto,profileID:settings.selectedID,profileName:selectedProfile()?.name,network:"Другая Wi-Fi-сеть",message:"VPN подключён · связь проверена",guardActive:true,verifiedAt:Date(),events:[],tunnel:nil)
         }
         if let i = CommandLine.arguments.firstIndex(of:"--preview-console-style"), i+1 < CommandLine.arguments.count { testConsoleAppearance = ConsoleAppearance(rawValue:CommandLine.arguments[i+1]) }
+        if let i = CommandLine.arguments.firstIndex(of:"--preview-routing-style"), i+1 < CommandLine.arguments.count { testRoutingAppearance = RoutingAppearance(rawValue:CommandLine.arguments[i+1]) }
+        if tab == "Маршруты" {
+            settings.routing.mode = .rules
+            settings.routing.rules = ["youtube","telegram","openai","github"].compactMap { id in guard let entry = routingDatabase.snapshot.services[id] else { return nil }; return RoutingRule(name:entry.name,serviceID:id,sourcePath:entry.sourcePath,baseDomains:entry.domains,destination:id == "github" ? .direct : .vpn) }
+            settings.routing.rules.append(RoutingRule(name:"Мой сервер",domains:["panel.hl100.ru"],destination:.direct)); routingSelectedID = settings.routing.rules.first?.id
+        }
         if let i = CommandLine.arguments.firstIndex(of:"--preview-menu-style"), i+1 < CommandLine.arguments.count { testMenuAppearance = MenuAppearance(rawValue:CommandLine.arguments[i+1]) }
         buildPage(); updateStatus(); window.setContentSize(NSSize(width:760,height:700)); window.contentView?.layoutSubtreeIfNeeded()
         guard let i = CommandLine.arguments.firstIndex(of:"--render-preview"), i+1 < CommandLine.arguments.count, let windowView = window.contentView else { NSApp.terminate(nil); return }
@@ -1030,6 +1102,9 @@ if let index = CommandLine.arguments.firstIndex(of:"--validate-profile"), index+
         print("AmneziaWG profile validated, including helper transport and UAPI serialization. No keys printed, stored or sent; no network changes.")
         exit(0)
     } catch { fputs("Profile validation failed: \(error.localizedDescription)\n",stderr); exit(1) }
+}
+if let index = CommandLine.arguments.firstIndex(of:"--routing-live-check"), index+1 < CommandLine.arguments.count {
+    exit(RoutingLiveCheck.run(profilePath:CommandLine.arguments[index+1]))
 }
 if let index = CommandLine.arguments.firstIndex(of:"--ipc-test-client"), index+1 < CommandLine.arguments.count {
     do { let fd = try IPC.connect(CommandLine.arguments[index+1]); defer { close(fd) }; let answer = String(data:try IPC.readLine(fd:fd),encoding:.utf8); guard answer == "allowed" else { throw AppError.message("Client was rejected") }; print("Signed app IPC authentication passed; no settings or network changes"); exit(0) } catch { fputs("IPC authentication test failed\n",stderr); exit(1) }

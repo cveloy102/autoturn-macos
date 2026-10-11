@@ -8,6 +8,14 @@ protocol TrafficProtection: AnyObject {
     func restoreToken(_ value: String?)
     func apply(tunnel: String?, profile: Profile?) throws
     func remove() throws
+    func configureRouting(_ settings: RoutingSettings, physical: PhysicalNetwork) throws
+    func setRoutingInterface(_ interface: String?) throws
+    func setDirectAddresses(_ addresses: Set<String>) throws
+}
+extension TrafficProtection {
+    func setRoutingInterface(_ interface: String?) throws {}
+    func configureRouting(_ settings: RoutingSettings, physical: PhysicalNetwork) throws {}
+    func setDirectAddresses(_ addresses: Set<String>) throws {}
 }
 protocol ManagedTunnel: AnyObject {
     var running: Bool { get }
@@ -15,7 +23,9 @@ protocol ManagedTunnel: AnyObject {
     func recoverJournal()
     func start(_ profile: Profile, physical: PhysicalNetwork, engine: String) throws
     func stop() throws
+    func setRoutingMode(_ mode: RoutingMode)
 }
+extension ManagedTunnel { func setRoutingMode(_ mode: RoutingMode) {} }
 
 struct CommandResult { var code: Int32; var output: String }
 enum SystemCommand {
@@ -37,6 +47,7 @@ struct PhysicalNetwork {
     var interface: String?
     var gateway: String?
     var service: String?
+    var gateway6: String?
     var available: Bool { interface != nil && gateway != nil }
     static func read() -> PhysicalNetwork {
         guard let store = SCDynamicStoreCreate(nil, "AutoTurn" as CFString, nil, nil), let global = SCDynamicStoreCopyValue(store, "State:/Network/Global/IPv4" as CFString) as? [String: Any], let service = global["PrimaryService"] as? String, let values = SCDynamicStoreCopyValue(store, "State:/Network/Service/\(service)/IPv4" as CFString) as? [String: Any] else { return PhysicalNetwork() }
@@ -44,7 +55,10 @@ struct PhysicalNetwork {
         guard let interface = iface, interface.range(of: "^(en|bridge|eth)[0-9]+$", options: .regularExpression) != nil else { return PhysicalNetwork() }
         let router = values["Router"] as? String
         guard let gateway = router, Profile.isIP(gateway) else { return PhysicalNetwork(interface: interface, gateway: nil, service: service) }
-        return PhysicalNetwork(interface: interface, gateway: gateway, service: service)
+        let v6 = SCDynamicStoreCopyValue(store, "State:/Network/Service/\(service)/IPv6" as CFString) as? [String:Any]
+        var gateway6 = v6?["Router"] as? String
+        if let g = gateway6, Profile.isIP(g) { if g.lowercased().hasPrefix("fe80:") { gateway6 = g + "%" + interface } } else { gateway6 = nil }
+        return PhysicalNetwork(interface: interface, gateway: gateway, service: service,gateway6:gateway6)
     }
 }
 
@@ -53,15 +67,32 @@ final class TrafficGuard: TrafficProtection {
     static let anchor = "com.apple/autoturn"
     private(set) var token: String?
     private var lastRules = ""
+    private let lock = NSRecursiveLock()
+    private var routing = RoutingSettings(), physical = PhysicalNetwork()
+    private var coreInterface: String?
+    func configureRouting(_ settings: RoutingSettings, physical: PhysicalNetwork) throws { lock.lock(); defer { lock.unlock() }; routing = settings; self.physical = physical }
+    func setRoutingInterface(_ interface: String?) throws {
+        lock.lock(); defer { lock.unlock() }
+        guard interface == nil || interface!.range(of:"^utun[0-9]+$",options:.regularExpression) != nil else { throw AppError.message("Некорректный интерфейс маршрутов") }
+        coreInterface = interface
+    }
+    func setDirectAddresses(_ addresses: Set<String>) throws {}
     var active = false
     func restoreToken(_ value: String?) { if let value = value, UInt64(value) != nil, let result = try? SystemCommand.run("/sbin/pfctl", ["-s", "info"]), result.output.contains("Status: Enabled") { token = value } }
     func apply(tunnel: String?, profile: Profile?) throws {
+        lock.lock(); defer { lock.unlock() }
         let root = try SystemCommand.checked("/sbin/pfctl", ["-sr"])
         guard root.contains("anchor \"com.apple/*\"") else { throw AppError.message("В PF нет системного якоря com.apple/*. Автоматически менять правила не будем.") }
         if let tunnel = tunnel, tunnel.range(of: "^utun[0-9]+$", options: .regularExpression) == nil { throw AppError.message("Некорректный интерфейс") }
         var rules = "pass out quick on lo0 all\n"
+        if routing.mode == .rules, let core = coreInterface { rules += "pass out quick on \(core) all\n" }
         if let tunnel = tunnel { rules += "pass out quick on \(tunnel) all\n" }
         if let profile = profile, let ip = profile.resolvedIP, Profile.isIP(ip) { rules += "pass out quick \(ip.contains(":") ? "inet6" : "inet") proto udp to \(ip) port \(profile.endpointPort) keep state\n" }
+        if routing.mode == .rules, coreInterface != nil, let iface = physical.interface {
+            // All ordinary app flows enter the routing TUN. Only the root-owned
+            // core can open physical outbound sockets; it has no proxy listener.
+            rules += "pass out quick on \(iface) proto { tcp udp } user root keep state\n"
+        }
         rules += "pass out quick inet proto udp from any port 68 to any port 67\npass out quick inet6 proto udp from any port 546 to any port 547\npass out quick inet6 proto icmp6 icmp6-type { routersol, neighbrsol, neighbradv }\nblock drop out quick all\n"
         if rules != lastRules || !active {
             _ = try SystemCommand.checked("/sbin/pfctl", ["-a", Self.anchor, "-f", "-"], input: rules)
@@ -77,6 +108,7 @@ final class TrafficGuard: TrafficProtection {
         }
     }
     func remove() throws {
+        lock.lock(); defer { lock.unlock() }
         _ = try SystemCommand.checked("/sbin/pfctl", ["-a", Self.anchor, "-F", "rules"])
         active = false; lastRules = ""
         if let token = token { _ = try SystemCommand.checked("/sbin/pfctl", ["-X", token]) }
@@ -89,6 +121,8 @@ final class Tunnel: ManagedTunnel {
     var interface: String?
     private var endpointRoute: (String, String)?
     private var dnsService: String?
+    var routingMode: RoutingMode = .all
+    func setRoutingMode(_ mode: RoutingMode) { routingMode = mode }
     private var splitRoutes: [(Bool, String)] = []
     private let journal = "/Library/Application Support/AutoTurn/network-journal.json"
     struct Journal: Codable { var endpoint: String?; var gateway: String?; var dnsKey: String? }
@@ -127,12 +161,17 @@ final class Tunnel: ManagedTunnel {
             else { _ = try SystemCommand.checked("/sbin/ifconfig", [iface, "inet", host, host, "netmask", netmask(Int(components[1])!), "alias"]) }
         }
         _ = try SystemCommand.checked("/sbin/ifconfig", [iface, "mtu", String(profile.mtu), "up"])
+        if routingMode == .rules {
+            _ = try SystemCommand.checked("/sbin/route",["-n","add","-ifscope",iface,"default","-interface",iface])
+        } else {
         for route in ["0.0.0.0/1", "128.0.0.0/1"] { _ = try SystemCommand.checked("/sbin/route", ["-n", "add", "-net", route, "-interface", iface]); splitRoutes.append((false, route)) }
         if profile.hasIPv6 { for route in ["::/1", "8000::/1"] { _ = try SystemCommand.checked("/sbin/route", ["-n", "add", "-inet6", route, "-interface", iface]); splitRoutes.append((true, route)) } }
+        }
         guard let store = SCDynamicStoreCreate(nil, "AutoTurnDNS" as CFString, nil, nil) else { throw AppError.message("DNS недоступен") }
         // A separate supplemental resolver, removed by key; never overwrite user DNS.
         let key = "State:/Network/Service/AutoTurn-\(primaryService)/DNS" as CFString
         let dns: [String: Any] = ["ServerAddresses": profile.dns, "SupplementalMatchDomains": [""], "SupplementalMatchOrders": [0], "InterfaceName": iface]
+        if routingMode == .rules { return }
         dnsService = key as String
         saveJournal()
         guard SCDynamicStoreSetValue(store, key, dns as CFDictionary) else { throw AppError.message("Не удалось установить DNS") }
@@ -143,6 +182,7 @@ final class Tunnel: ManagedTunnel {
             if SCDynamicStoreCopyValue(store,key as CFString) != nil && !SCDynamicStoreRemoveValue(store, key as CFString) { errors.append("Не удалось убрать DNS AutoTurn") }
             else { dnsService = nil }
         }
+        if routingMode == .rules, let iface = interface { _ = try? SystemCommand.run("/sbin/route",["-n","delete","-ifscope",iface,"default","-interface",iface]) }
         for (v6, route) in splitRoutes.reversed() {
             let result = try? SystemCommand.run("/sbin/route", ["-n", "delete"] + (v6 ? ["-inet6"] : []) + ["-net", route, "-interface", interface ?? ""])
             if result == nil { errors.append("Не удалось удалить маршрут AutoTurn") }
@@ -166,11 +206,18 @@ final class Tunnel: ManagedTunnel {
 }
 
 enum HealthProbe {
-    static func check(tunnel: String) -> Bool {
+    static func check(tunnel: String, dns: [String]? = nil) -> Bool {
         // Curl is bound to this utun; physical egress is independently blocked by PF.
         let endpoints = ["https://www.apple.com/library/test/success.html", "https://www.cloudflare.com/cdn-cgi/trace"]
         for endpoint in endpoints {
-            if let result = try? SystemCommand.run("/usr/bin/curl", ["--silent", "--fail", "--noproxy", "*", "--interface", tunnel, "--connect-timeout", "3", "--max-time", "5", "--max-filesize", "8192", endpoint]), result.code == 0, !result.output.isEmpty { return true }
+            var extra: [String] = []
+            if let dns = dns, let server = dns.first(where: { !$0.contains(":") }), let host = URL(string:endpoint)?.host {
+                let labels = host.split(separator:".")
+                var query = Data([0x43,0x21,1,0,0,1,0,0,0,0,0,0]); for l in labels { query.append(UInt8(l.utf8.count)); query.append(contentsOf:l.utf8) }; query.append(contentsOf:[0,0,1,0,1])
+                guard let response = try? RoutingDNSProxy.exchange(query,upstream:server,interface:tunnel,tcp:false), let records = try? DNSPacket(response).answers(matching:query), let ip = records.compactMap({$0.ip}).first(where: { !$0.contains(":") }) else { continue }
+                extra = ["--resolve","\(host):443:\(ip)"]
+            }
+            if let result = try? SystemCommand.run("/usr/bin/curl", ["--silent", "--fail", "--noproxy", "*", "--interface", tunnel, "--connect-timeout", "3", "--max-time", "5", "--max-filesize", "8192"] + extra + [endpoint]), result.code == 0, !result.output.isEmpty { return true }
         }
         return false
     }
