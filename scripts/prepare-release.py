@@ -28,8 +28,8 @@ info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
 public = base64.b64encode(key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)).decode()
 if info.get('ATUpdatePublicKey') != public: raise SystemExit('App update public key differs from signing key; rebuild first.')
 subprocess.run(['/usr/bin/codesign', '--verify', '--deep', '--strict', str(app)], check=True)
-archs = subprocess.check_output(['/usr/bin/lipo', '-archs', str(app/'Contents/MacOS/AutoTurn')], text=True)
-if not all(a in archs for a in ('x86_64','arm64')): raise SystemExit('Do not publish an Intel-only build to the universal channel.')
+for component in ('Contents/MacOS/AutoTurn', 'Contents/Library/LaunchServices/AutoTurnHelper', 'Contents/Resources/amneziawg-go'):
+    subprocess.run(['/usr/bin/lipo', str(app / component), '-verify_arch', 'x86_64', 'arm64'], check=True)
 version, build = info['CFBundleShortVersionString'], int(info['CFBundleVersion'])
 archive = root / f'dist/AutoTurn-{version}-macOS.zip'
 subprocess.run(['/usr/bin/ditto','-c','-k','--sequesterRsrc','--keepParent',str(app),str(archive)],check=True)
