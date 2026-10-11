@@ -11,7 +11,7 @@ extension Controller {
         page.addArrangedSubview(heading("Маршруты_"))
         page.addArrangedSubview(label(settings.routing.mode == .all ? "Весь интернет через VPN. Правила сохранены для переключения." : "Всё напрямую. Через VPN — только выбранные сервисы, домены и IP.",size:11,color:Palette.dim))
         if !serviceAvailable && !preview { page.addArrangedSubview(ActionButton("Установить новую VPN-службу…",primary:true) { [weak self] in self?.installService() }) }
-        let modes = stack(vertical:false,spacing:0)
+        let modes = stack(vertical:false,spacing:0); modes.distribution = .fillEqually
         for (mode,title) in [(RoutingMode.all,"Всё через VPN"),(.rules,"По правилам")] {
             modes.addArrangedSubview(ActionButton(title,primary:settings.routing.mode == mode) { [weak self] in guard let self = self else { return }; self.settings.routing.mode = mode; self.persistRouting() })
         }

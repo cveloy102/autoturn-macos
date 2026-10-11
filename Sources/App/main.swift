@@ -397,6 +397,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
         })
         row.addArrangedSubview(ActionButton("Сохранить сети",primary:true) { [weak self] in guard let self = self else { return }; let homes = field.stringValue.components(separatedBy:CharacterSet(charactersIn:",\n")).map { $0.trimmingCharacters(in:.whitespaces) }.filter { !$0.isEmpty }; guard homes.count <= 32, homes.allSatisfy({$0.utf8.count <= 32}) else { self.showError(AppError.message("Слишком длинное название сети")); return }; self.settings.homeSSIDs = Array(NSOrderedSet(array:homes)) as? [String] ?? homes; self.persistAndConfigure() })
         row.addArrangedSubview(NSView()); page.addArrangedSubview(row)
+        page.addArrangedSubview(ActionButton("Настройки геолокации macOS…") { [weak self] in self?.observer.requestPermission() })
+        page.addArrangedSubview(label("Разреши AutoTurn доступ к геолокации, чтобы определять домашний Wi-Fi. Разрешение включается в системных настройках macOS.",size:11,color:Palette.dim))
         let login = NSButton(checkboxWithTitle:"Запускать AutoTurn при входе",target:self,action:#selector(toggleLogin(_:))); login.state = settings.launchAtLogin ? .on : .off; page.addArrangedSubview(login)
         page.addArrangedSubview(label("В настройках геолокации включи службы геолокации и разреши AutoTurn. После разрешения текущая сеть появится здесь; нажми «Сохранить сети». Ethernet считаем внешней сетью.",size:11,color:Palette.dim))
     }
