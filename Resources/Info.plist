@@ -8,14 +8,16 @@
 	<string>AutoTurn</string>
 	<key>CFBundleIdentifier</key>
 	<string>ru.hl100.autoturn</string>
+	<key>CFBundleIconFile</key>
+	<string>AutoTurn</string>
 	<key>CFBundleName</key>
 	<string>AutoTurn</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.6</string>
+	<string>0.1.7</string>
 	<key>CFBundleVersion</key>
-	<string>7</string>
+	<string>8</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
 	<key>LSUIElement</key>

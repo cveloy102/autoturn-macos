@@ -45,6 +45,9 @@ for ARCH in $ARCHS; do APPS+=("$BUILD/AutoTurn-$ARCH"); HELPERS+=("$BUILD/AutoTu
 cp "$ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
 if [ -s "$ROOT/Resources/update-public-key.txt" ]; then /usr/libexec/PlistBuddy -c "Set :ATUpdatePublicKey $(cat "$ROOT/Resources/update-public-key.txt")" "$APP/Contents/Info.plist"; fi
 cp "$ROOT/Resources/install-service.sh" "$APP/Contents/Resources/"
+"$SWIFTC" -sdk "$SDK" -target "$(uname -m)-apple-macosx13.0" "$ROOT/scripts/make-icons.swift" -o "$BUILD/make-icons" -framework AppKit
+"$BUILD/make-icons" "$BUILD/AutoTurn.iconset"
+/usr/bin/iconutil -c icns "$BUILD/AutoTurn.iconset" -o "$APP/Contents/Resources/AutoTurn.icns"
 cp "$ENGINE_SOURCE/LICENSE" "$APP/Contents/Resources/AmneziaWG-LICENSE.txt"
 printf '%s\n' 'v3.1.20260828 b5928efb6ca19f0153958460c3d141f04abc5c2e' > "$APP/Contents/Resources/engine-provenance.txt"
 chmod +x "$APP/Contents/Resources/install-service.sh"

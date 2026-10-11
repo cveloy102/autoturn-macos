@@ -184,6 +184,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         buildWindow(); buildStatusItem()
         if CommandLine.arguments.contains("--ui-self-check") { checkInterface(); return }; if preview { renderPreview(); return }
         observer.changed = { [weak self] network in guard let self = self else { return }; self.updateHomeNetwork(network); guard self.serviceAvailable else { return }; self.client.send(RPCRequest(command:"network",settings:nil,network:network)) { self.accept($0,quiet:true) } }
+        if settings.mode == .auto && !settings.homeSSIDs.isEmpty { observer.requestInitialPermission() }
         NSWorkspace.shared.notificationCenter.addObserver(self,selector:#selector(woke),name:NSWorkspace.didWakeNotification,object:nil)
         refresh()
         timer = Timer(timeInterval:1,repeats:true) { [weak self] _ in
@@ -241,7 +242,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
     func connectionPage() {
         page.addArrangedSubview(label("[ 01 / CONNECTION ]",size:11,color:Palette.red))
         connectionTitle = heading(titleForStatus()); page.addArrangedSubview(connectionTitle!)
-        connectionMessage = label(status.message,color:Palette.dim); page.addArrangedSubview(connectionMessage!)
+        connectionMessage = label(connectionDescription(),color:Palette.dim); page.addArrangedSubview(connectionMessage!)
         if settings.profiles.isEmpty {
             page.addArrangedSubview(ActionButton("+ Добавить профиль",primary:true) { [weak self] in self?.importProfile() })
             page.addArrangedSubview(label("Выбери файл AmneziaWG .conf или перетащи его в это окно.",size:12,color:Palette.dim))
@@ -336,7 +337,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
     }
     func buildStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength:NSStatusItem.variableLength)
-        statusItem.button?.image = NSImage(systemSymbolName:"shield",accessibilityDescription:"AutoTurn"); statusItem.button?.image?.isTemplate = true; statusItem.button?.title = ""; statusItem.button?.font = NSFont.monospacedSystemFont(ofSize:16,weight:.regular)
+        statusItem.button?.image = StatusIcon.unknown.image; statusItem.button?.title = ""
         statusItem.button?.target = self; statusItem.button?.action = #selector(togglePopover)
         statusItem.button?.toolTip = "AutoTurn · powered by LENCHA"
         popover.behavior = .transient; popover.animates = false; popover.delegate = self
@@ -360,10 +361,10 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         y += 37; place(line(),1); y += 17
         let dot = NSView(); fill(dot,color:status.phase == .connected ? Palette.green : status.phase == .error || status.phase == .recovering ? Palette.red : status.phase == .connecting || status.phase == .waiting ? NSColor.systemOrange : Palette.dim)
         place(dot,7,16,7); dot.frame.origin.y += 5
-        let message = label(status.message,size:12)
-        let messageHeight = max(18,ceil((status.message as NSString).boundingRect(with:NSSize(width:244,height:200),options:[.usesLineFragmentOrigin,.usesFontLeading],attributes:[.font:message.font!]).height)+3)
+        let message = label(connectionDescription(),size:12)
+        let messageHeight = max(18,ceil((message.stringValue as NSString).boundingRect(with:NSSize(width:244,height:200),options:[.usesLineFragmentOrigin,.usesFontLeading],attributes:[.font:message.font!]).height)+3)
         place(message,messageHeight,32,244); y += messageHeight+6
-        let reason = status.phase == .home ? "Домашняя сеть" : status.phase == .waiting ? "Сеть недоступна" : status.phase == .off ? "Выключено вручную" : status.phase == .setup ? "Настройка" : "Вне дома"
+        let reason = needsLocationPermission() ? "Wi-Fi не определён" : status.phase == .home ? "Домашняя сеть" : status.phase == .waiting ? "Сеть недоступна" : status.phase == .off ? "Выключено вручную" : status.phase == .setup ? "Настройка" : "Вне дома"
         let detail = label("\(reason) · \(status.profileName ?? selectedProfile()?.name ?? "нет профиля")",size:11,color:Palette.dim)
         detail.maximumNumberOfLines = 1; detail.lineBreakMode = .byTruncatingTail
         place(detail,18); y += 34
@@ -387,6 +388,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         divider()
         row("Домашняя сеть…","house") { [weak self] in self?.tab = "Домашняя сеть"; self?.openWindow() }
         row("Открыть пульт…","slider.horizontal.3") { [weak self] in self?.openWindow() }
+        if needsLocationPermission() { row("Разрешить определение Wi-Fi…","location") { [weak self] in self?.observer.requestPermission() } }
         row("Диагностика…","terminal") { [weak self] in self?.tab = "События"; self?.openWindow() }
         row("+ Добавить профиль…") { [weak self] in self?.openWindow(); self?.importProfile() }
         row(updater.candidate.map { "Обновить до \($0.version)…" } ?? "Проверить обновления…","arrow.triangle.2.circlepath") { [weak self] in self?.checkUpdates() }
@@ -399,7 +401,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         view.frame.size.height = y; view.layoutSubtreeIfNeeded(); return view
     }
     func menuRevision() -> String {
-        ([settings.mode.rawValue,status.phase.rawValue,status.message,status.network,status.profileID ?? "",settings.selectedID ?? "",String(status.guardActive),String(serviceAvailable),String(updater.candidate?.build ?? 0)] + settings.profiles.map { $0.id + $0.name }).joined(separator:"\u{1f}")
+        ([settings.mode.rawValue,status.phase.rawValue,connectionDescription(),status.network,status.profileID ?? "",settings.selectedID ?? "",String(status.guardActive),String(serviceAvailable),String(updater.candidate?.build ?? 0)] + settings.profiles.map { $0.id + $0.name }).joined(separator:"\u{1f}")
     }
     func refreshOpenMenu() {
         guard popover.isShown, renderedMenuRevision != menuRevision() else { return }
@@ -436,16 +438,24 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         if !preview { refresh() }
     }
     func openWindow() { popover.performClose(nil); buildPage(); window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps:true) }
+    func needsLocationPermission() -> Bool {
+        guard !preview, settings.mode == .auto, !settings.homeSSIDs.isEmpty, observer.locationPermissionMissing else { return false }
+        let network = observer.snapshot()
+        return network.available && network.ssid == nil
+    }
+    func connectionDescription() -> String {
+        needsLocationPermission() ? "Разреши геолокацию для определения домашнего Wi-Fi. Пока сеть не определена, VPN остаётся включён." : status.message
+    }
     func titleForStatus() -> String { switch status.phase { case .setup:return "Начнём с профиля_"; case .home:return "Ты дома_"; case .connecting:return "Проверяем связь_"; case .connected:return "На связи_"; case .waiting:return "Ждём сеть_"; case .recovering:return "Держим VPN_"; case .off:return "Выключено вручную_"; case .error:return "Нужно внимание_" } }
     func guardDescription() -> String { if !serviceAvailable { return FileManager.default.fileExists(atPath:"/Library/LaunchDaemons/ru.hl100.autoturn.helper.plist") ? "Состояние службы и блокировки не подтверждено" : "VPN-служба ещё не установлена; интернет не изменён" }; return status.guardActive ? "Прямой трафик заблокирован" : "Блокировка прямого доступа выключена" }
     func selectedProfile() -> Profile? { settings.profiles.first { $0.id == settings.selectedID } ?? settings.profiles.first }
     func updateStatus() {
-        if let title = connectionTitle { paintHeading(title,titleForStatus()) }; connectionMessage?.stringValue = status.message; connectionNetwork?.stringValue = status.network; connectionProfile?.stringValue = status.profileName ?? selectedProfile()?.name ?? "не выбран"; connectionGuard?.stringValue = guardDescription(); connectionGuard?.textColor = status.guardActive ? Palette.green : Palette.dim
+        if let title = connectionTitle { paintHeading(title,titleForStatus()) }; connectionMessage?.stringValue = connectionDescription(); connectionNetwork?.stringValue = status.network; connectionProfile?.stringValue = status.profileName ?? selectedProfile()?.name ?? "не выбран"; connectionGuard?.stringValue = guardDescription(); connectionGuard?.textColor = status.guardActive ? Palette.green : Palette.dim
         let modeName = settings.mode == .auto ? "АВТО" : settings.mode == .on ? "ВРУЧНУЮ" : "ВЫКЛЮЧЕНО"
         let phaseNames: [Phase:String] = [.setup:"НАСТРОЙКА",.home:"ДОМА",.connecting:"ПОДКЛЮЧЕНИЕ",.connected:"ПРОВЕРЕНО",.waiting:"ОЖИДАНИЕ",.recovering:"РЕЗЕРВ",.off:"ПАУЗА",.error:"ОШИБКА"]
         footer?.stringValue = "\(modeName) / \(phaseNames[status.phase] ?? "")"
-        let symbol = status.phase == .connected ? "▪" : status.phase == .recovering || status.phase == .error ? "!" : status.phase == .home ? "⌂" : "·"
-        statusItem.button?.title = " \(symbol)"; statusItem.button?.toolTip = "AutoTurn · \(status.message)"
+        statusItem.button?.image = StatusIcon.state(status.phase,missingLocation:needsLocationPermission()).image
+        statusItem.button?.title = ""; statusItem.button?.toolTip = "AutoTurn · \(connectionDescription())"
         refreshOpenMenu()
         if observeLiveNetwork && observedRevision != menuRevision() {
             observedRevision = menuRevision()
@@ -470,7 +480,9 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
     func setMode(_ mode: Mode) {
         if mode == .off && !liveNetworkTest && !confirm("Отключить VPN?",detail:"Вне дома интернет сможет идти напрямую. Автоматика будет выключена до возврата в Авто.") { return }
         guard mode == .off || !settings.profiles.isEmpty else { tab = "Профили"; openWindow(); return }
-        settings.mode = mode; buildPage(); refreshOpenMenu()
+        settings.mode = mode
+        if mode == .auto && !settings.homeSSIDs.isEmpty { observer.requestInitialPermission() }
+        buildPage(); refreshOpenMenu()
         let snapshot = settings
         // Apply the user's network action before Keychain persistence. In particular,
         // Off must not depend on reading/validating profiles or an unlocked Keychain.
@@ -654,6 +666,16 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
     func checkInterface() {
         func require(_ condition:Bool,_ message:String) { if !condition { fputs("UI check failed: \(message)\n",stderr); exit(1) } }
         func buttons(_ view:NSView) -> [ActionButton] { (view as? ActionButton).map { [$0] } ?? view.subviews.flatMap { buttons($0) } }
+        var iconImages = Set<Data>()
+        for icon in StatusIcon.allCases {
+            let image = icon.image
+            require(image.isTemplate && image.size == NSSize(width:18,height:18),"status icon dimensions/template")
+            guard let data = image.tiffRepresentation, let bitmap = NSBitmapImageRep(data:data) else { require(false,"status icon rasterization"); return }
+            require(bitmap.pixelsWide >= 18 && bitmap.pixelsHigh >= 18,"status icon raster size")
+            iconImages.insert(data)
+        }
+        require(iconImages.count == StatusIcon.allCases.count,"status icons must differ visually")
+        require(StatusIcon.state(.home,missingLocation:false) == .home && StatusIcon.state(.connected,missingLocation:false) == .connected && StatusIcon.state(.connected,missingLocation:true) == .unknown,"status icon home/VPN/permission mapping")
         let sample = Profile(name:"Резервный профиль с длинным названием",addresses:["10.0.0.2/32"],dns:["1.1.1.1"],mtu:1280,interface:[:],peer:[:],endpointHost:"198.51.100.10",endpointPort:51820,resolvedIP:"198.51.100.10")
         for profiles in [[],[sample,sample,sample]] {
             settings.profiles = profiles

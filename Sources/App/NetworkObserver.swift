@@ -12,8 +12,15 @@ final class NetworkObserver: NSObject, CLLocationManagerDelegate {
     var changed: ((NetworkObservation) -> Void)?
     override init() { super.init(); location.delegate = self; monitor.pathUpdateHandler = { [weak self] _ in DispatchQueue.main.async { self?.report() } }; monitor.start(queue: DispatchQueue(label: "ru.hl100.autoturn.network")); timer = Timer(timeInterval: 3, repeats: true) { [weak self] _ in self?.report() }; RunLoop.main.add(timer!,forMode:.common) }
     static let locationSettingsURL = URL(string:"x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_LocationServices")!
-    func requestPermission() {
+    func requestInitialPermission() {
         if location.authorizationStatus == .notDetermined { location.requestAlwaysAuthorization() }
+    }
+    var locationPermissionMissing: Bool {
+        let status = location.authorizationStatus
+        return !CLLocationManager.locationServicesEnabled() || (status != .authorizedAlways && status != .authorized)
+    }
+    func requestPermission() {
+        requestInitialPermission()
         // Re-requesting a denied permission does not show another system prompt.
         if !NSWorkspace.shared.open(Self.locationSettingsURL) {
             NSWorkspace.shared.open(URL(string:"x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension")!)
