@@ -204,3 +204,10 @@ for seedService in seedJSON["services"] as! [[String:Any]] {
  expect(!accepted.rules[0].allDomains.isEmpty || !accepted.rules[0].allIPRanges.isEmpty,"Bundled service cannot be added")
 }
 print("\(passed) checks including every actual bundled service passed")
+let plainIPs = try RoutingIPImport.parse("# ChatGPT\n104.18.0.1\n2606:4700::/32\n104.18.0.1\n")
+expect(plainIPs.count == 1 && plainIPs[0].ranges == ["104.18.0.1/32","2606:4700::/32"],"IP-list import lost IPv6 or duplicate handling")
+let hydraIPs = try RoutingIPImport.parse("##ChatGPT\n/HydraRoute\n104.18.0.0/16\n\n##Disabled\n#/Other\n192.0.2.0/24\n\n##YouTube\n/Other\n203.0.113.1\n")
+expect(hydraIPs.count == 2 && hydraIPs[0].name.contains("ChatGPT") && !hydraIPs.flatMap { $0.ranges }.contains("192.0.2.0/24"),"Hydra import merged groups or imported disabled block")
+expect((try? RoutingIPImport.parse("chatgpt.com")) == nil,"Domain silently accepted as IP")
+expect((try? RoutingIPImport.parse("/VPN\ngeoip:ru")) == nil,"Unsupported GeoIP directive silently accepted")
+print("\(passed) checks including IP-list and Hydra block imports passed")

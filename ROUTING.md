@@ -56,3 +56,20 @@ TUN HTTPS and cleanup, then a simulated trusted home SSID on the same physical
 interface, full VPN compatibility, and Off. Always stops the test VPN at exit.
 Real Wi-Fi switching, DoH/ECH in actual browsers, core process failure, and IPv6
 must be checked separately. Cross compilation is not a physical M1 test.
+
+## IP list additions and service selection
+
+The routing detail imports a UTF-8 IP/CIDR text list from a file or direct HTTPS URL
+into the existing rule. Domains and previous IP additions remain; duplicates are skipped.
+HydraRoute Classic/Neo `ip.list` groups are recognized; disabled groups are skipped,
+and multiple active groups require choosing one before importing. `geoip:` directives
+require exporting concrete IP/CIDR addresses and are rejected with a clear message.
+The confirmation shows the number of new entries and the current rule destination.
+These imported addresses are manual additions and survive service database refreshes.
+
+The add dialog filters services while typing, recognizes domain aliases, and allows
+multiple checked services/custom rules. Selections persist when changing the search.
+The catalog is in a 330-point scroll area. Bulk additions are validated atomically.
+
+Modal informational and confirmation dialogs close the status panel first so it cannot
+cover the connection-check result.

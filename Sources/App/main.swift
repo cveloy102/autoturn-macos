@@ -811,9 +811,9 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
     func quit() { guard confirm("Отключить VPN и завершить?",detail:"Вне дома будет разрешён прямой интернет. Закрытие одного пульта не отключает VPN.") else { return }; if serviceAvailable { busy = true; client.send(RPCRequest(command:"stop",settings:nil,network:nil)) { result in self.busy = false; switch result { case .success(let response) where response.ok: NSApp.terminate(nil); default:self.accept(result); self.info("Не удалось подтвердить остановку службы. AutoTurn остаётся открыт.") } } } else { NSApp.terminate(nil) } }
     func windowShouldClose(_ sender:NSWindow) -> Bool { sender.orderOut(nil); return false }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender:NSApplication) -> Bool { false }
-    func confirm(_ title:String,detail:String) -> Bool { let alert = ApplicationArtwork.alert(title:title,detail:detail); alert.addButton(withTitle:"Продолжить"); alert.addButton(withTitle:"Отмена"); return alert.runModal() == .alertFirstButtonReturn }
+    func confirm(_ title:String,detail:String) -> Bool { popover.performClose(nil); NSApp.activate(ignoringOtherApps:true); let alert = ApplicationArtwork.alert(title:title,detail:detail); alert.addButton(withTitle:"Продолжить"); alert.addButton(withTitle:"Отмена"); return alert.runModal() == .alertFirstButtonReturn }
     func showError(_ error:Error) { info(error.localizedDescription) }
-    func info(_ text:String) { let alert = ApplicationArtwork.alert(title:"AutoTurn",detail:text); alert.addButton(withTitle:"OK"); alert.runModal() }
+    func info(_ text:String) { popover.performClose(nil); NSApp.activate(ignoringOtherApps:true); let alert = ApplicationArtwork.alert(title:"AutoTurn",detail:text); alert.addButton(withTitle:"OK"); alert.runModal() }
     private func quote(_ text:String) -> String { "'" + text.replacingOccurrences(of:"'",with:"'\\''") + "'" }
     private func appleString(_ text:String) -> String { "\"" + text.replacingOccurrences(of:"\\",with:"\\\\").replacingOccurrences(of:"\"",with:"\\\"") + "\"" }
     func beginLiveNetworkTest() {
@@ -885,6 +885,13 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
     func checkInterface() {
         func require(_ condition:Bool,_ message:String) { if !condition { fputs("UI check failed: \(message)\n",stderr); exit(1) } }
         func buttons(_ view:NSView) -> [ActionButton] { (view as? ActionButton).map { [$0] } ?? view.subviews.flatMap { buttons($0) } }
+        let routingPicker = RoutingPicker(database:routingDatabase,query:"te")
+        require(routingPicker.rows.arrangedSubviews.contains { ($0 as? NSButton)?.title == "Telegram" },"routing picker must suggest Telegram while typing")
+        routingPicker.selected.insert("telegram"); routingPicker.search.stringValue = "chatgpt.com"; routingPicker.updateRows()
+        require(routingPicker.selected.contains("telegram") && routingPicker.rows.arrangedSubviews.contains { ($0 as? NSButton)?.title.hasPrefix("Своё правило:") == true },"routing selection must survive search and offer custom domains")
+        require(routingPicker.rows.arrangedSubviews.contains { ($0 as? NSButton)?.identifier?.rawValue == "openai" },"domain alias must suggest its service")
+        routingPicker.search.stringValue = ""; routingPicker.updateRows(); routingPicker.layoutSubtreeIfNeeded()
+        require(routingPicker.rows.arrangedSubviews.count > 5 && routingPicker.subviews.compactMap { $0 as? NSScrollView }.first!.frame.height >= 330,"routing picker must show a tall scrollable catalog")
         require(ApplicationArtwork.icon != nil,"bundled application artwork")
         let iconAlert = ApplicationArtwork.alert(title:"AutoTurn",detail:"Icon check")
         require(iconAlert.icon === ApplicationArtwork.icon && !iconAlert.icon.isTemplate,"dialog must use bundled application artwork")

@@ -98,3 +98,31 @@ enum RoutingPolicy {
         return result.sorted()
     }
 }
+
+struct RoutingIPBlock {
+    var name: String
+    var ranges: [String]
+}
+enum RoutingIPImport {
+    static func parse(_ text: String) throws -> [RoutingIPBlock] {
+        guard text.utf8.count <= 700000 else { throw AppError.message("IP-список слишком большой") }
+        let lines = text.components(separatedBy:.newlines)
+        let hydra = lines.contains { $0.trimmingCharacters(in:.whitespaces).hasPrefix("/") || $0.trimmingCharacters(in:.whitespaces).hasPrefix("#/") }
+        var blocks: [RoutingIPBlock] = [], ranges = Set<String>(), name = "IP-список", enabled = !hydra, description = ""
+        func flush() { if !ranges.isEmpty { blocks.append(RoutingIPBlock(name:name,ranges:ranges.sorted())); ranges.removeAll() } }
+        for (index,raw) in lines.enumerated() {
+            let line = raw.trimmingCharacters(in:.whitespacesAndNewlines)
+            if line.hasPrefix("##") { if hydra { flush(); enabled = false }; description = String(line.dropFirst(2)).trimmingCharacters(in:.whitespaces); continue }
+            if line.hasPrefix("#/") { flush(); enabled = false; continue }
+            if line.hasPrefix("/") { flush(); enabled = true; name = description.isEmpty ? String(line.dropFirst()) : description + " · " + String(line.dropFirst()); description = ""; continue }
+            if line.isEmpty { if hydra { flush(); enabled = false }; continue }
+            if line.hasPrefix("#") || !enabled { continue }
+            guard !line.hasPrefix("geoip:") else { throw AppError.message("GeoIP-директивы требуют готового списка IP/CIDR. Экспортируй адреса, а не geoip:тег.") }
+            if Profile.validCIDR(line) { ranges.insert(line) }
+            else if Profile.isIP(line) { ranges.insert(line + (line.contains(":") ? "/128" : "/32")) }
+            else { throw AppError.message("Некорректный IP или CIDR в строке \(index + 1)") }
+            guard ranges.count <= 2048 else { throw AppError.message("В дополнениях допускается до 2048 IP/подсетей") }
+        }
+        flush(); guard !blocks.isEmpty else { throw AppError.message("В файле нет включённых IP-адресов или подсетей") }; return blocks
+    }
+}

@@ -98,6 +98,7 @@ extension Controller {
             if rule.allDomains.count > 8 { detail.addArrangedSubview(label("Ещё \(rule.allDomains.count-8) · весь список в редакторе",size:11,color:Palette.dim)) }
             detail.addArrangedSubview(ActionButton("Редактировать дополнения…") { [weak self] in self?.editRoutingRule(rule) })
         }
+        detail.addArrangedSubview(ActionButton("Загрузить IP-список…") { [weak self] in self?.importIPList(rule) })
         if !rule.allIPRanges.isEmpty { detail.addArrangedSubview(label("IP / подсети: \(rule.allIPRanges.count)",size:11,color:Palette.dim)); detail.addArrangedSubview(label(rule.allIPRanges.prefix(8).joined(separator:"\n"),size:11)) }
         detail.addArrangedSubview(label(rule.destination == .vpn ? "При сбое VPN этот трафик не выходит напрямую." : "Опознанные соединения идут напрямую.",size:11,color:Palette.dim))
         detail.addArrangedSubview(ActionButton(rule.enabled ? "Выключить правило" : "Включить правило") { [weak self] in guard let self = self, let index = self.settings.routing.rules.firstIndex(where: { $0.id == rule.id }) else { return }; self.settings.routing.rules[index].enabled.toggle(); self.persistRouting() })
@@ -111,40 +112,44 @@ extension Controller {
         persistAndConfigure(); buildPage()
     }
     func addRoutingRule(suggestion: String? = nil) {
-        let alert = ApplicationArtwork.alert(title:"Добавить сервис или домен",detail:"Выбери готовый сервис либо введи свой домен. Для сервиса загрузим весь список из Geo-Aggregator.")
-        let combo = NSComboBox(frame:NSRect(x:0,y:0,width:370,height:28)); combo.addItems(withObjectValues:routingDatabase.snapshot.catalog.services.map { $0.name }); combo.stringValue = suggestion ?? routingQuery; combo.completes = true
-        alert.accessoryView = combo; alert.addButton(withTitle:"Добавить"); alert.addButton(withTitle:"Отмена")
+        popover.performClose(nil)
+        let picker = RoutingPicker(database:routingDatabase,query:suggestion ?? routingQuery)
+        let alert = ApplicationArtwork.alert(title:"Добавить маршруты",detail:"Отметь нужные сервисы. Поиск подсказывает сервисы и домены; можно выбрать сразу несколько.")
+        alert.accessoryView = picker; alert.addButton(withTitle:"Добавить выбранные"); alert.addButton(withTitle:"Отмена")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         alert.window.makeFirstResponder(nil)
-        let value = combo.stringValue.trimmingCharacters(in:.whitespacesAndNewlines)
-        var selected = routingDatabase.find(value)
-        if selected == nil && !value.contains(".") && !value.contains(":") && !value.contains("/") {
-            let candidates = routingDatabase.snapshot.catalog.services.filter { $0.name.localizedCaseInsensitiveContains(value) || $0.id.localizedCaseInsensitiveContains(value) }
-            if !candidates.isEmpty && !value.isEmpty {
-                let picker = ApplicationArtwork.alert(title:"Выбери сервис",detail:"По запросу «\(value)» найдено \(candidates.count) сервисов.")
-                let menu = NSPopUpButton(frame:NSRect(x:0,y:0,width:370,height:28)); menu.addItems(withTitles:candidates.map { $0.name }); picker.accessoryView = menu; picker.addButton(withTitle:"Добавить"); picker.addButton(withTitle:"Отмена")
-                guard picker.runModal() == .alertFirstButtonReturn else { return }; selected = candidates[menu.indexOfSelectedItem]
-            }
-        }
-        if let service = selected {
-            if let existing = settings.routing.rules.first(where: { $0.serviceID == service.id }) { routingSelectedID = existing.id; tab = "Маршруты"; buildPage(); return }
-            var rule = RoutingRule(name:service.name,serviceID:service.id,sourcePath:service.src)
-            if let cached = routingDatabase.snapshot.services[service.id] { rule.baseDomains = cached.domains; appendRoutingRule(rule); return }
-            guard !routingBusy else { info("Дождись завершения обновления базы"); return }
-            routingBusy = true; routingFeedback = "Загружаем \(service.name)…"; buildPage()
-            routingDatabase.refresh(rules:settings.routing.rules+[rule]) { [weak self] result in
-                guard let self = self else { return }; self.routingBusy = false
-                switch result { case .success(let snapshot): if let data = snapshot.services[service.id] { rule.baseDomains = data.domains; self.routingFeedback = "\(service.name) добавлен"; self.appendRoutingRule(rule) }; case .failure(let error):self.routingFeedback = "Сервис не добавлен: " + error.localizedDescription; if self.tab == "Маршруты" { self.buildPage() } }
-            }
-        } else {
-            do {
+        guard !picker.selected.isEmpty || !picker.custom.isEmpty else { info("Отметь галочками сервисы или своё правило"); return }
+        do {
+            var additions = picker.services.filter { picker.selected.contains($0.id) }.map { RoutingRule(name:$0.name,serviceID:$0.id,sourcePath:$0.src) }
+            // Existing services are focused rather than duplicated.
+            additions.removeAll { item in settings.routing.rules.contains { $0.serviceID == item.serviceID } }
+            for value in picker.custom.sorted() {
                 var rule = RoutingRule(name:value)
-                if Profile.isIP(value) { rule.ipRanges = [value+(value.contains(":") ? "/128" : "/32")] }
-                else if Profile.validCIDR(value) { rule.ipRanges = [value] }
+                if Profile.validCIDR(value) { rule.ipRanges = [value] }
+                else if Profile.isIP(value) { rule.ipRanges = [value + (value.contains(":") ? "/128" : "/32")] }
                 else { rule.domains = [try RoutingPolicy.normalizeDomain(value)] }
-                appendRoutingRule(rule)
-            } catch { showError(error) }
-        }
+                additions.append(rule)
+            }
+            guard !additions.isEmpty else { routingSelectedID = settings.routing.rules.first { picker.selected.contains($0.serviceID ?? "") }?.id; buildPage(); return }
+            if additions.allSatisfy({ $0.serviceID == nil || routingDatabase.snapshot.services[$0.serviceID!] != nil }) {
+                for i in additions.indices { if let id = additions[i].serviceID { additions[i].baseDomains = routingDatabase.snapshot.services[id]?.domains ?? [] } }
+                appendRoutingRules(additions); return
+            }
+            guard !routingBusy else { info("Дождись завершения обновления базы"); return }
+            routingBusy = true; routingFeedback = "Загружаем выбранные сервисы…"; buildPage()
+            routingDatabase.refresh(rules:settings.routing.rules + additions) { [weak self] result in
+                guard let self = self else { return }; self.routingBusy = false
+                switch result {
+                case .success(let snapshot):
+                    for i in additions.indices { if let id = additions[i].serviceID { guard let data = snapshot.services[id] else { self.info("Не получен список сервиса: " + additions[i].name); return }; additions[i].baseDomains = data.domains } }
+                    self.appendRoutingRules(additions)
+                case .failure(let error): self.routingFeedback = "Сервисы не добавлены: " + error.localizedDescription; if self.tab == "Маршруты" { self.buildPage() }
+                }
+            }
+        } catch { showError(error) }
+    }
+    func appendRoutingRules(_ rules: [RoutingRule]) {
+        do { var updated = settings.routing; updated.rules += rules; settings.routing = try updated.validated(); routingSelectedID = rules.first?.id; routingFeedback = "Добавлено правил: \(rules.count)"; persistRouting() } catch { showError(error) }
     }
     func appendRoutingRule(_ rule: RoutingRule) {
         do { var updated = settings.routing; updated.rules.append(rule); settings.routing = try updated.validated(); routingSelectedID = rule.id; persistRouting() } catch { showError(error) }
