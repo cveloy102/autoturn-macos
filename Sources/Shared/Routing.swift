@@ -9,11 +9,13 @@ struct RoutingRule: Codable, Equatable {
     var serviceID: String?
     var sourcePath: String?
     var baseDomains: [String] = []
+    var baseIPRanges: [String]?
     var domains: [String] = []
     var ipRanges: [String] = []
     var destination: RouteDestination = .vpn
     var enabled = true
-    var allDomains: [String] { Array(Set(baseDomains + domains)).sorted() }
+    var allDomains: [String] { Array(Set((baseDomains + domains).filter { !Profile.validCIDR($0) && !Profile.isIP($0) })).sorted() }
+    var allIPRanges: [String] { Array(Set((baseIPRanges ?? []) + ipRanges + baseDomains.compactMap { Profile.validCIDR($0) ? $0 : Profile.isIP($0) ? $0 + ($0.contains(":") ? "/128" : "/32") : nil })).sorted() }
 }
 struct RoutingSettings: Codable, Equatable {
     var mode: RoutingMode = .all
@@ -26,12 +28,14 @@ struct RoutingSettings: Codable, Equatable {
         copy.rules = try rules.map { rule in
             guard UUID(uuidString:rule.id) != nil, !rule.name.isEmpty, rule.name.utf8.count <= 128, rule.ipRanges.count <= 2048 else { throw AppError.message("Некорректное правило маршрутизации") }
             var r = rule
-            r.baseDomains = try rule.baseDomains.map(RoutingPolicy.normalizeDomain)
+            r.baseDomains = try rule.baseDomains.filter { !Profile.validCIDR($0) && !Profile.isIP($0) }.map(RoutingPolicy.normalizeDomain)
+            let baseRanges = Array(Set((rule.baseIPRanges ?? []) + rule.baseDomains.compactMap { Profile.validCIDR($0) ? $0 : Profile.isIP($0) ? $0 + ($0.contains(":") ? "/128" : "/32") : nil })).sorted()
+            r.baseIPRanges = baseRanges.isEmpty ? rule.baseIPRanges : baseRanges
             r.domains = try rule.domains.map(RoutingPolicy.normalizeDomain)
-            guard r.ipRanges.allSatisfy(Profile.validCIDR), r.serviceID == nil || r.sourcePath.map(RoutingPolicy.validSourcePath) == true else { throw AppError.message("Некорректный источник или IP-подсеть") }
+            guard r.allIPRanges.count <= 12000, r.allIPRanges.allSatisfy(Profile.validCIDR), r.serviceID == nil || r.sourcePath.map(RoutingPolicy.validSourcePath) == true else { throw AppError.message("Некорректный источник или IP-подсеть") }
             return r
         }
-        guard copy.rules.reduce(0, { $0 + $1.allDomains.count }) <= 12000, (try JSONEncoder().encode(copy)).count <= 700000 else { throw AppError.message("Список слишком большой: максимум 12 000 доменов") }
+        guard copy.rules.reduce(0, { $0 + $1.allDomains.count + $1.allIPRanges.count }) <= 12000, (try JSONEncoder().encode(copy)).count <= 700000 else { throw AppError.message("Список слишком большой: максимум 12 000 доменов и IP-подсетей") }
         return copy
     }
 }
@@ -70,7 +74,7 @@ enum RoutingPolicy {
     }
     static func addressDestination(_ ip: String, settings: RoutingSettings) -> RouteDestination? {
         var result: RouteDestination?
-        for rule in settings.rules where rule.enabled { for range in rule.ipRanges where contains(ip,cidr:range) { if rule.destination == .vpn { return .vpn }; result = .direct } }
+        for rule in settings.rules where rule.enabled { for range in rule.allIPRanges where contains(ip,cidr:range) { if rule.destination == .vpn { return .vpn }; result = .direct } }
         return result
     }
     static func contains(_ ip: String, cidr: String) -> Bool {
@@ -86,7 +90,9 @@ enum RoutingPolicy {
         for raw in text.components(separatedBy:.newlines) {
             let line = raw.trimmingCharacters(in:.whitespacesAndNewlines)
             if line.isEmpty || line.hasPrefix("#") { continue }
-            result.insert(try normalizeDomain(line))
+            if Profile.validCIDR(line) { result.insert(line) }
+            else if Profile.isIP(line) { result.insert(line + (line.contains(":") ? "/128" : "/32")) }
+            else { result.insert(try normalizeDomain(line)) }
         }
         guard !result.isEmpty else { throw AppError.message("Источник вернул пустой список доменов") }
         return result.sorted()

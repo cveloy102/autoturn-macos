@@ -173,4 +173,34 @@ expect(ipv4Inbounds[0]["address"] as? [String] == ["172.29.255.1/30"],"IPv4-only
 let dualCore = try JSONSerialization.jsonObject(with:RoutingCoreConfiguration.make(routes,physicalInterface:"en0",gateway:"192.168.1.1",tunnel:"utun3",dns:"1.1.1.1",supportsIPv6:true)) as! [String:Any]
 let dualInbounds = dualCore["inbounds"] as! [[String:Any]]
 expect((dualInbounds[0]["address"] as? [String])?.count == 2,"Dual-stack VPN lost IPv6 configuration")
+var telegramRoutes = RoutingSettings(); telegramRoutes.mode = .rules
+var telegramRule = RoutingRule(name:"Telegram",serviceID:"telegram",sourcePath:"source2/telegram.txt")
+telegramRule.baseDomains = try RoutingPolicy.parseList("# mixed upstream\n149.154.160.0/20\n2001:67c:4e8::/48\ntelegram.org\nt.me\n")
+telegramRule.ipRanges = ["192.0.2.0/24"]
+telegramRoutes.rules = [telegramRule]; telegramRoutes = try telegramRoutes.validated()
+expect(telegramRoutes.rules[0].baseDomains == ["t.me","telegram.org"],"Service IP ranges remained in domain list")
+expect(telegramRoutes.rules[0].allIPRanges.count == 3,"Service IP ranges or manual additions lost")
+expect(RoutingPolicy.addressDestination("149.154.167.51",settings:telegramRoutes) == .vpn,"Telegram IP not routed through VPN")
+let telegramConfig = try JSONSerialization.jsonObject(with:RoutingCoreConfiguration.make(telegramRoutes,physicalInterface:"en0",gateway:"192.168.1.1",tunnel:"utun3",dns:"1.1.1.1")) as! [String:Any]
+let routeConfig = telegramConfig["route"] as! [String:Any]
+expect(routeConfig["final"] as? String == "direct","Unselected or opaque traffic incorrectly defaults to VPN")
+let coreRules = routeConfig["rules"] as! [[String:Any]]
+expect(coreRules.contains { ($0["ip_cidr"] as? [String])?.contains("149.154.160.0/20") == true && $0["outbound"] as? String == "vpn" },"Imported service IP ranges absent from live core policy")
+let roundTrip = try RoutingExport.read(JSONEncoder().encode(RoutingExport(routing:telegramRoutes)))
+expect(roundTrip.rules == telegramRoutes.rules,"Export/import lost service IP ranges")
+let oldRule = try JSONDecoder().decode(RoutingRule.self,from:Data("{\"id\":\"00000000-0000-0000-0000-000000000001\",\"name\":\"Telegram\",\"baseDomains\":[\"149.154.160.0/20\",\"t.me\"],\"domains\":[],\"ipRanges\":[],\"destination\":\"vpn\",\"enabled\":true}".utf8))
+var oldRoutes = RoutingSettings(); oldRoutes.rules = [oldRule]
+let migratedRoutes = try oldRoutes.validated()
+expect(migratedRoutes.rules[0].allDomains == ["t.me"] && migratedRoutes.rules[0].allIPRanges == ["149.154.160.0/20"],"Old mixed service rule could not be migrated")
 print("\(passed) total checks including migration, domain/CIDR precedence, route export and input validation.")
+let projectRoot = URL(fileURLWithPath:#filePath).deletingLastPathComponent().deletingLastPathComponent()
+let seedData = try Data(contentsOf:projectRoot.appendingPathComponent("Resources/Routing/seed.json"))
+let seedJSON = try JSONSerialization.jsonObject(with:seedData) as! [String:Any]
+for seedService in seedJSON["services"] as! [[String:Any]] {
+ var item = RoutingRule(name:seedService["name"] as! String,serviceID:seedService["id"] as? String,sourcePath:seedService["sourcePath"] as? String)
+ item.baseDomains = seedService["domains"] as! [String]
+ var settings = RoutingSettings(); settings.rules = [item]
+ let accepted = try settings.validated()
+ expect(!accepted.rules[0].allDomains.isEmpty || !accepted.rules[0].allIPRanges.isEmpty,"Bundled service cannot be added")
+}
+print("\(passed) checks including every actual bundled service passed")

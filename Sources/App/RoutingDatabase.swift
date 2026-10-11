@@ -63,7 +63,7 @@ final class RoutingDatabase {
                     guard let text = String(data:data,encoding:.utf8) else { throw AppError.message("Некорректная кодировка базы") }
                     services[id] = ServiceDomains(id:id,name:service.name,sourcePath:service.src,domains:try RoutingPolicy.parseList(text))
                 }
-                var routing = RoutingSettings(); routing.rules = rules.map { rule in var r = rule; if let id = r.serviceID, let service = services[id] { r.baseDomains = service.domains; r.sourcePath = service.sourcePath }; return r }; _ = try routing.validated()
+                var routing = RoutingSettings(); routing.rules = rules.map { rule in var r = rule; if let id = r.serviceID, let service = services[id] { r.baseDomains = service.domains; r.baseIPRanges = nil; r.sourcePath = service.sourcePath }; return r }; _ = try routing.validated()
                 return RoutingDatabaseSnapshot(catalog:catalog,services:services,updatedAt:Date(),commit:sha)
             }
             DispatchQueue.main.async {

@@ -9,14 +9,18 @@ Rules mode runs a separate TUN core in front of AmneziaWG. DNS fake addresses
 preserve each destination name per flow, instead of changing a global host route
 for a shared CDN address. Domain rules use the most specific suffix; equally
 specific VPN rules take priority. Static IP rules are the fallback. Identified
-unlisted domains go direct; unknown opaque connections go through VPN. Browser
-DoH does not automatically expose destination names: readable TLS/QUIC names can
-be classified; ECH without a local DNS mapping conservatively stays in VPN.
-The presence of the ECH extension is treated as opaque, including GREASE:
-the outer server name alone cannot authorize direct egress. In live Chrome
-with Cloudflare DoH, this means even a direct Apple rule can remain in VPN
-and become unavailable when that VPN is down. This is a known limitation,
-not evidence that all direct rules work with every browser DNS setting.
+unlisted domains and opaque connections go direct. Only matched VPN domains
+or IP ranges use VPN. Service lists may mix domains and IPv4/IPv6 CIDRs; these
+are stored separately, including migration of old mixed baseDomains values.
+Manual additions are preserved when the service base is refreshed.
+
+Browser DoH does not automatically expose destination names. Readable TLS/QUIC
+names can be classified; ECH without a local DNS mapping can only match IP
+rules. The presence of the ECH extension is treated as opaque, including GREASE:
+the outer server name cannot identify the inner destination. With the requested
+direct default, a domain-only VPN rule cannot cover an opaque DoH/ECH flow.
+Use the application's DNS for domain classification, or IP ranges for those
+flows. Do not claim fail-closed coverage of a selected domain that is hidden.
 
 The routing TUN advertises IPv6 only when the AWG profile has an IPv6 address.
 Advertising IPv6 for an IPv4-only profile made Chrome choose endpoints that

@@ -14,7 +14,7 @@ enum RoutingCoreConfiguration {
         } }
         rules.append(["action":"resolve","server":"physical-dns","strategy":"ipv4_only"])
         for destination in [RouteDestination.vpn,.direct] {
-            let ranges = Array(Set(enabled.filter { $0.destination == destination }.flatMap { $0.ipRanges })).sorted()
+            let ranges = Array(Set(enabled.filter { $0.destination == destination }.flatMap { $0.allIPRanges })).sorted()
             if !ranges.isEmpty { rules.append(["ip_cidr":ranges,"action":"route","outbound":destination.rawValue]) }
         }
         rules.append(["inbound":["autoturn-domain"],"action":"route","outbound":"direct"])
@@ -26,7 +26,7 @@ enum RoutingCoreConfiguration {
             "inbounds":[["type":"tun","tag":"routing-in","interface_name":routingInterface,"address":supportsIPv6 ? ["172.29.255.1/30","fd99:6175:746f::1/126"] : ["172.29.255.1/30"],"mtu":1280,"auto_route":true,"strict_route":true,"dns_mode":"hijack","stack":"gvisor"]],
             "outbounds":[["type":"direct","tag":"direct","bind_interface":physicalInterface,"domain_resolver":["server":"physical-dns","strategy":"ipv4_only"]],["type":"direct","tag":"vpn","bind_interface":tunnel,"domain_resolver":["server":"vpn-dns","strategy":"ipv4_only"]]],
             "dns":["servers":[["type":"udp","tag":"physical-dns","server":gateway,"detour":"direct"],["type":"udp","tag":"vpn-dns","server":dns,"detour":"vpn"],["type":"fakeip","tag":"domain-map","inet4_range":"198.18.0.0/15","inet6_range":"fc00::/18"]],"rules":[["query_type":["A","AAAA"],"action":"route","server":"domain-map"]],"final":"physical-dns","strategy":"ipv4_only"],
-            "route":["default_interface":physicalInterface,"default_domain_resolver":"physical-dns","rules":rules,"final":"vpn"]
+            "route":["default_interface":physicalInterface,"default_domain_resolver":"physical-dns","rules":rules,"final":"direct"]
         ]
         return try JSONSerialization.data(withJSONObject:config,options:[.sortedKeys])
     }
