@@ -21,6 +21,7 @@ final class Service {
     var nextCheck = Date.distantPast
     var guardRequired = false
     var pendingTunnelReset = false
+    var startupRecoveryError: Error?
     let installation: Installation
     let timer: DispatchSourceTimer
     let monitor = NWPathMonitor()
@@ -32,6 +33,9 @@ final class Service {
             guardRequired = saved.required; guardManager.restoreToken(saved.token)
         }
         if guardRequired { do { try guardManager.apply(tunnel:nil,profile:nil); saveGuard() } catch { status.phase = .error; status.message = "Не удалось восстановить блокировку после перезапуска" } }
+        if monitoring && stateDirectory == support {
+            do { try OwnedProcessRecovery.stop() } catch { startupRecoveryError = error; status.phase = .error; status.message = error.localizedDescription }
+        }
         domainRoutes.recoverJournal(); tunnel.recoverJournal()
         timer.schedule(deadline: monitoring ? .now() : .now() + 3600, repeating: monitoring ? 5 : 3600)
         timer.setEventHandler { [weak self] in self?.tick() }; timer.resume()
@@ -75,6 +79,17 @@ final class Service {
                 guard settings.profiles.count > 1 else { throw AppError.message("Нет резервного профиля") }
                 if settings.mode != .off { try guardManager.apply(tunnel: nil, profile: nil); guardRequired = true; saveGuard(); try tunnel.stop() }
                 index = Policy.next(index: index, count: settings.profiles.count); attempted = 0; failures = 0; nextCheck = .distantPast; tick()
+            case "recover":
+                settings.mode = .off; pendingTunnelReset = false
+                var errors: [String] = []
+                do { try guardManager.remove() } catch { errors.append(error.localizedDescription) }
+                do { try domainRoutes.stop() } catch { errors.append(error.localizedDescription) }
+                do { try tunnel.stop() } catch { errors.append(error.localizedDescription) }
+                if stateDirectory == support { do { try OwnedProcessRecovery.stop() } catch { errors.append(error.localizedDescription) } }
+                domainRoutes.recoverJournal(); tunnel.recoverJournal()
+                guardRequired = guardManager.active; saveGuard()
+                guard errors.isEmpty else { throw AppError.message(errors.joined(separator:". ")) }
+                startupRecoveryError = nil; tick(); event("Обычный интернет восстановлен. Автоматика выключена.")
             case "stop": settings.mode = .off; tick()
             default: throw AppError.message("Команда не поддерживается")
             }
@@ -85,6 +100,7 @@ final class Service {
         }
     }
     func tick() {
+        if let error = startupRecoveryError { status.phase = .error; status.message = error.localizedDescription; return }
         let physical = physicalRead()
         let changed = physical.interface != observedPhysical.interface || physical.gateway != observedPhysical.gateway
         if changed { if observation.interface != physical.interface || observation.gateway != physical.gateway { observedAt = .distantPast }; nextCheck = .distantPast }

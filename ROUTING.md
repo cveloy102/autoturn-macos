@@ -73,3 +73,19 @@ The catalog is in a 330-point scroll area. Bulk additions are validated atomical
 
 Modal informational and confirmation dialogs close the status panel first so it cannot
 cover the connection-check result.
+
+## Network recovery
+
+Helper replacement previously left orphaned routing/AWG processes alive. On startup,
+only root-owned processes with the exact AutoTurn executable and argument list are
+terminated before DNS/endpoint-journal recovery. PF remains in place until policy
+determines whether direct traffic is allowed. An unsuccessful cleanup reports error.
+
+“Восстановить обычный интернет” is available in every console/menu theme. It saves
+Off, then uses authenticated recover RPC to release protection and stop engines
+(including any orphans), remove own DNS/journal routes and remain Off. It retains
+profiles/home networks/routing rules. Unavailable IPC falls back to the installed
+root-owned helper's --emergency-recover, with standard macOS admin authorization.
+That independent path stops only the AutoTurn launchd service and its exact engines,
+releases its PF anchor/token, recovers DNS/endpoint journal and restarts the service.
+Router settings and other VPN processes are untouched.

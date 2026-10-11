@@ -59,6 +59,10 @@ if let index = CommandLine.arguments.firstIndex(of:"--ipc-test-server"), index+2
     if client >= 0 { try? IPC.write(Data((allowed ? "allowed\n" : "denied\n").utf8),fd:client); close(client) }
     close(fd); unlink(path); print(allowed ? "Signed app client authenticated" : "Unapproved client rejected"); exit(allowed ? 0 : 2)
 }
+if CommandLine.arguments.contains("--emergency-recover") {
+    do { try EmergencyNetworkRecovery.run(); print("AutoTurn network settings removed; normal network restored"); exit(0) }
+    catch { fputs((error.localizedDescription + "\n"),stderr); exit(1) }
+}
 guard getuid() == 0 else { fputs("Helper must run as the installed launchd service.\n", stderr); exit(1) }
 do {
     let installation = try JSONDecoder().decode(Installation.self, from: Data(contentsOf: URL(fileURLWithPath: support + "/installation.json")))

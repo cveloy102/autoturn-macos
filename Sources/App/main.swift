@@ -197,6 +197,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
     var consoleEventsField:NSTextField?
     var connectionCheckField:NSTextField?
     var notifyingVersions = Set<String>()
+    var recoveringNetwork = false
     var timer: Timer?, connectionTitle: NSTextField?, connectionMessage: NSTextField?, connectionNetwork: NSTextField?, connectionProfile: NSTextField?, connectionGuard: NSTextField?
     let liveNetworkTest = CommandLine.arguments.contains("--live-network-test")
     var testExitCode: Int32 = 0
@@ -329,6 +330,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
         check.font = NSFont.monospacedSystemFont(ofSize:11,weight:.regular); next.font = check.font
         let actions = narrow ? stack([check,next],spacing:8) : stack([check,next],vertical:false,spacing:8)
         left.addArrangedSubview(actions)
+        left.addArrangedSubview(ActionButton("Восстановить обычный интернет") { [weak self] in self?.emergencyRestore() })
         if !serviceAvailable { left.addArrangedSubview(ActionButton("Установить VPN-службу…") { [weak self] in self?.installService() }) }
         left.addArrangedSubview(label("При сбое — резерв по порядку. Прямой доступ закрыт до восстановления.",size:10,color:Palette.dim))
         right.addArrangedSubview(label("ПРОФИЛИ / ПО ПОРЯДКУ",size:10,color:Palette.dim))
@@ -555,6 +557,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
         if settings.profiles.isEmpty { row("+ Добавить профиль…") { [weak self] in self?.importProfile() } }
         else if style == .card || settings.profiles.count > 3 { row("Все профили…") { [weak self] in self?.tab = "Профили"; self?.openWindow() } }
         y += 12
+        row("Восстановить обычный интернет") { [weak self] in self?.emergencyRestore() }
         let check = ActionButton(checkingConnection ? "Проверяем HTTPS…" : "Проверить связь",primary:style == .calm) { [weak self] in self?.command("check") }
         check.cornerRadius = style == .instrument ? 2 : 7; check.isEnabled = serviceAvailable && !checkingConnection; place(check,36,20,246)
         let next = ActionButton("→") { [weak self] in self?.command("next") }; next.toolTip = "Следующий профиль"; next.isEnabled = serviceAvailable && settings.profiles.count > 1; next.cornerRadius = check.cornerRadius; place(next,36,274,38); y += 50
@@ -658,6 +661,33 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
     func accept(_ result: Result<RPCResponse,Error>, quiet: Bool = false) {
         switch result { case .success(let response):serviceAvailable = true; status = response.status; if !response.ok && !quiet { showError(AppError.message(response.error ?? "Ошибка службы")) }; case .failure(let error):serviceAvailable = false; status.phase = .setup; status.message = FileManager.default.fileExists(atPath:"/Library/LaunchDaemons/ru.hl100.autoturn.helper.plist") ? "Служба недоступна. Её состояние и блокировку сейчас подтвердить нельзя." : "Импортируй AmneziaWG .conf и установи VPN-службу"; if !quiet { showError(error) } }
         updateStatus()
+    }
+    func emergencyRestore() {
+        popover.performClose(nil)
+        guard !recoveringNetwork else { return }; recoveringNetwork = true
+        settings.mode = .off
+        do { if !preview { try Storage.save(settings) } } catch { routingFeedback = "Режим выключен; сохранить настройки не удалось: " + error.localizedDescription }
+        busy = true
+        client.send(RPCRequest(command:"recover",settings:nil,network:nil)) { [weak self] result in
+            guard let self = self else { return }; self.busy = false; self.accept(result,quiet:true); self.buildPage()
+            if case .success(let response) = result, response.ok { self.recoveringNetwork = false; self.info("Настройки VPN сняты. Автоматика выключена; профили и маршруты сохранены. Интернет работает через твою обычную сеть.") }
+            else { self.emergencyRestoreWithAdministrator() }
+        }
+    }
+    func emergencyRestoreWithAdministrator() {
+        // Independent root helper path also works if authenticated IPC is unavailable.
+        let script = "do shell script " + appleString("'/Library/Application Support/AutoTurn/AutoTurnHelper' --emergency-recover") + " with administrator privileges"
+        busy = true
+        DispatchQueue.global().async { [weak self] in
+            let process = Process(); process.executableURL = URL(fileURLWithPath:"/usr/bin/osascript"); process.arguments = ["-e",script]; process.standardOutput = FileHandle.nullDevice; process.standardError = FileHandle.nullDevice
+            var success = false
+            do { try process.run(); process.waitUntilExit(); success = process.terminationStatus == 0 } catch {}
+            DispatchQueue.main.async {
+                guard let self = self else { return }; self.busy = false; self.recoveringNetwork = false
+                if success { self.persistAndConfigure(); self.info("Настройки AutoTurn сняты с правами администратора. Автоматика выключена.") }
+                else { self.info("Восстановление не подтверждено. Если macOS запросила пароль администратора, разреши восстановление и повтори.") }
+            }
+        }
     }
     func command(_ command: String) {
         guard !busy else { return }
@@ -925,6 +955,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
             let menu = menuView(); menu.layoutSubtreeIfNeeded(); require(buttons(menu).contains { $0.title == "Ещё ···" },"menu management missing")
             require(menu.bounds.width == 332,"menu width differs from approved design")
             require(buttons(menu).contains { $0.title == "Открыть пульт ↗" },"console shortcut missing")
+            require(buttons(menu).contains { $0.title == "Восстановить обычный интернет" },"menu emergency recovery missing")
             require(buttons(menu).filter { $0.profileSubtitle != nil }.count == profiles.count,"menu profile rows missing")
             for button in buttons(menu) {
                 let frame = button.convert(button.bounds,to:menu)
@@ -971,7 +1002,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
                         require(button.frame.width > 20 && button.frame.height >= 36,"theme collapsed control")
                         require(frame.minX >= -1 && frame.maxX <= body.bounds.width+1,"theme action exceeds content width")
                     }
-                    if name == "Соединение" { require(buttons(body).contains { $0.title == "Проверить связь" },"console theme lost check action") }
+                    if name == "Соединение" { require(buttons(body).contains { $0.title == "Проверить связь" },"console theme lost check action"); require(buttons(body).contains { $0.title == "Восстановить обычный интернет" },"console emergency recovery missing") }
                     if name == "Настройки" { require(Set(buttons(body).map { $0.title }).isSuperset(of:ConsoleAppearance.allCases.map(\.title)),"console themes missing") }
                 }
             }
@@ -1109,6 +1140,10 @@ if let index = CommandLine.arguments.firstIndex(of:"--validate-profile"), index+
         print("AmneziaWG profile validated, including helper transport and UAPI serialization. No keys printed, stored or sent; no network changes.")
         exit(0)
     } catch { fputs("Profile validation failed: \(error.localizedDescription)\n",stderr); exit(1) }
+}
+if CommandLine.arguments.contains("--recover-network-check") {
+    do { let reply = try IPC.request(RPCRequest(command:"recover",settings:nil,network:nil)); guard reply.ok && reply.status.phase == .off && !reply.status.guardActive else { throw AppError.message(reply.error ?? "Network cleanup not confirmed") }; print("Emergency recovery confirmed: Off, guard released; saved settings untouched"); exit(0) }
+    catch { fputs((error.localizedDescription + "\n"),stderr); exit(1) }
 }
 if let index = CommandLine.arguments.firstIndex(of:"--routing-live-check"), index+1 < CommandLine.arguments.count {
     exit(RoutingLiveCheck.run(profilePath:CommandLine.arguments[index+1]))
