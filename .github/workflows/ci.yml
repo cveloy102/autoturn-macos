@@ -1,0 +1,30 @@
+name: Intel and Apple Silicon
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-14, macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.0'
+          cache: false
+      - name: Host architecture
+        run: uname -m
+      - name: Core and service tests
+        run: bash scripts/test.sh
+      - name: Universal build
+        run: bash scripts/build.sh
+      - name: Native app, helper, engine and IPC smoke
+        run: bash scripts/smoke.sh

@@ -1,0 +1,9 @@
+.build/
+dist/
+work-engine-*/
+.DS_Store
+*.conf
+*.key
+*.private
+*.pem
+secrets/
