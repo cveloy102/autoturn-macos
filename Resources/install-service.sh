@@ -44,6 +44,8 @@ if [ -d /Applications/AutoTurn.app ]; then
  /bin/mv /Applications/AutoTurn.app "$SUPPORT/previous-$(date +%Y%m%d-%H%M%S)-$$.app"
 fi
 /bin/mv "$STAGE" /Applications/AutoTurn.app
+# New folder timestamp invalidates Finder/Launchpad artwork cached for this path.
+/usr/bin/touch /Applications/AutoTurn.app
 cat > "/Library/LaunchDaemons/$LABEL.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

@@ -176,6 +176,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
     let preview = CommandLine.arguments.contains("--render-preview") || CommandLine.arguments.contains("--ui-self-check")
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        if let icon = ApplicationArtwork.icon { NSApp.applicationIconImage = icon }
         if !preview {
             do { settings = try Storage.load() }
             catch { showError(error); NSApp.terminate(nil); return }
@@ -592,9 +593,9 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
     func quit() { guard confirm("Отключить VPN и завершить?",detail:"Вне дома будет разрешён прямой интернет. Закрытие одного пульта не отключает VPN.") else { return }; if serviceAvailable { busy = true; client.send(RPCRequest(command:"stop",settings:nil,network:nil)) { result in self.busy = false; switch result { case .success(let response) where response.ok: NSApp.terminate(nil); default:self.accept(result); self.info("Не удалось подтвердить остановку службы. AutoTurn остаётся открыт.") } } } else { NSApp.terminate(nil) } }
     func windowShouldClose(_ sender:NSWindow) -> Bool { sender.orderOut(nil); return false }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender:NSApplication) -> Bool { false }
-    func confirm(_ title:String,detail:String) -> Bool { let alert = NSAlert(); alert.messageText = title; alert.informativeText = detail; alert.addButton(withTitle:"Продолжить"); alert.addButton(withTitle:"Отмена"); return alert.runModal() == .alertFirstButtonReturn }
+    func confirm(_ title:String,detail:String) -> Bool { let alert = ApplicationArtwork.alert(title:title,detail:detail); alert.addButton(withTitle:"Продолжить"); alert.addButton(withTitle:"Отмена"); return alert.runModal() == .alertFirstButtonReturn }
     func showError(_ error:Error) { info(error.localizedDescription) }
-    func info(_ text:String) { let alert = NSAlert(); alert.messageText = "AutoTurn"; alert.informativeText = text; alert.addButton(withTitle:"OK"); alert.runModal() }
+    func info(_ text:String) { let alert = ApplicationArtwork.alert(title:"AutoTurn",detail:text); alert.addButton(withTitle:"OK"); alert.runModal() }
     private func quote(_ text:String) -> String { "'" + text.replacingOccurrences(of:"'",with:"'\\''") + "'" }
     private func appleString(_ text:String) -> String { "\"" + text.replacingOccurrences(of:"\\",with:"\\\\").replacingOccurrences(of:"\"",with:"\\\"") + "\"" }
     func beginLiveNetworkTest() {
@@ -666,6 +667,9 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
     func checkInterface() {
         func require(_ condition:Bool,_ message:String) { if !condition { fputs("UI check failed: \(message)\n",stderr); exit(1) } }
         func buttons(_ view:NSView) -> [ActionButton] { (view as? ActionButton).map { [$0] } ?? view.subviews.flatMap { buttons($0) } }
+        require(ApplicationArtwork.icon != nil,"bundled application artwork")
+        let iconAlert = ApplicationArtwork.alert(title:"AutoTurn",detail:"Icon check")
+        require(iconAlert.icon === ApplicationArtwork.icon && !iconAlert.icon.isTemplate,"dialog must use bundled application artwork")
         var iconImages = Set<Data>()
         for icon in StatusIcon.allCases {
             let image = icon.image
@@ -795,5 +799,20 @@ if let index = CommandLine.arguments.firstIndex(of:"--ipc-test-client"), index+1
     do { let fd = try IPC.connect(CommandLine.arguments[index+1]); defer { close(fd) }; let answer = String(data:try IPC.readLine(fd:fd),encoding:.utf8); guard answer == "allowed" else { throw AppError.message("Client was rejected") }; print("Signed app IPC authentication passed; no settings or network changes"); exit(0) } catch { fputs("IPC authentication test failed\n",stderr); exit(1) }
 }
 let app = NSApplication.shared
+if let index = CommandLine.arguments.firstIndex(of:"--render-alert-preview"), index+1 < CommandLine.arguments.count {
+    app.setActivationPolicy(.accessory)
+    if let icon = ApplicationArtwork.icon { app.applicationIconImage = icon }
+    let alert = ApplicationArtwork.alert(title:"Доступен AutoTurn 0.1.8",detail:"Иконка приложения загружается напрямую из установленного пакета. Профили и настройки сохранятся. Скачать обновление?")
+    alert.addButton(withTitle:"Продолжить"); alert.addButton(withTitle:"Отмена")
+    alert.window.appearance = NSAppearance(named:.darkAqua)
+    alert.layout()
+    let view = alert.window.contentView!
+    view.layoutSubtreeIfNeeded()
+    let bitmap = view.bitmapImageRepForCachingDisplay(in:view.bounds)!
+    view.cacheDisplay(in:view.bounds,to:bitmap)
+    try! bitmap.representation(using:.png,properties:[:])!.write(to:URL(fileURLWithPath:CommandLine.arguments[index+1]))
+    print("Real NSAlert preview rendered; no settings, modal or network changes")
+    exit(0)
+}
 let controller = Controller(); app.delegate = controller; app.run()
 if controller.liveNetworkTest { exit(controller.testExitCode) }
