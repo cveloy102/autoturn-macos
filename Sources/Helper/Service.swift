@@ -127,7 +127,15 @@ final class Service {
             tunnel.setRoutingMode(settings.routing.mode)
             status.profileID = profile.id; status.profileName = profile.name
             if tunnel.running { try guardManager.apply(tunnel: tunnel.interface, profile: profile); saveGuard() }
-            if Date() < nextCheck { status.guardActive = guardManager.active; return }
+            if Date() < nextCheck {
+                // Core liveness must not wait for the VPN health/backoff timer.
+                // Keep PF active while a crashed routing process is recreated.
+                if tunnel.running {
+                    try domainRoutes.setTunnel(tunnel.interface,dns:profile.dns)
+                    try guardManager.apply(tunnel:tunnel.interface,profile:profile)
+                }
+                status.guardActive = guardManager.active; return
+            }
             if !tunnel.running {
                 status.phase = .connecting; status.message = "Создаём туннель и проверяем трафик"
                 try guardManager.apply(tunnel: nil, profile: profile); saveGuard()

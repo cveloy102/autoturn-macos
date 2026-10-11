@@ -69,6 +69,11 @@ response = configure(.auto,"home")
 check(response.ok && routing.configured == nil && !tunnel.running && !protection.active,"Home left DNS routing running")
 response = configure(.on,"home")
 check(response.ok && routing.configured?.mode == .rules,"Manual on did not configure routing")
+let checksBeforeIdleTick = routing.tunnelChecks
+service.nextCheck = Date().addingTimeInterval(60)
+service.tick()
+check(routing.tunnelChecks > checksBeforeIdleTick,"Core recovery waited for the VPN health timer")
+check(protection.active && tunnel.running,"Idle core check lost VPN protection")
 response = configure(.off,"home")
 check(response.ok && routing.configured == nil,"Manual off left domain routing running")
 routing.rejectStart = true
