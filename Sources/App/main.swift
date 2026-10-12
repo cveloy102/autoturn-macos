@@ -924,6 +924,11 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
         require(routingPicker.rows.arrangedSubviews.contains { ($0 as? NSButton)?.identifier?.rawValue == "openai" },"domain alias must suggest its service")
         routingPicker.search.stringValue = ""; routingPicker.updateRows(); routingPicker.layoutSubtreeIfNeeded()
         require(routingPicker.rows.arrangedSubviews.count > 5 && routingPicker.subviews.compactMap { $0 as? NSScrollView }.first!.frame.height >= 330,"routing picker must show a tall scrollable catalog")
+        let longAlert = ApplicationArtwork.alert(title:"Доступен AutoTurn 1.0.1",detail:String(repeating:"Длинное описание обновления: домены, маршруты, исправления.\n",count:400))
+        longAlert.addButton(withTitle:"Скачать обновление"); longAlert.addButton(withTitle:"Отмена"); longAlert.layout()
+        require(longAlert.accessoryView is NSScrollView,"long release notes must scroll")
+        require(longAlert.window.frame.height <= (NSScreen.main?.visibleFrame.height ?? 768),"long release notes exceed visible screen")
+        for button in longAlert.buttons { let frame = button.convert(button.bounds,to:longAlert.window.contentView); require(frame.minY >= 0 && frame.maxY <= longAlert.window.contentView!.bounds.height,"long release notes hide modal actions") }
         require(ApplicationArtwork.icon != nil,"bundled application artwork")
         let iconAlert = ApplicationArtwork.alert(title:"AutoTurn",detail:"Icon check")
         require(iconAlert.icon === ApplicationArtwork.icon && !iconAlert.icon.isTemplate,"dialog must use bundled application artwork")
