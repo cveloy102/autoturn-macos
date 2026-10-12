@@ -67,7 +67,7 @@ final class Updater {
         guard let url = URL(string:release.archiveURL), url.scheme == "https", url.host == "github.com", url.path.hasPrefix("/cveloy102/autoturn-macos/releases/download/"), url.user == nil, url.password == nil, url.query == nil, url.fragment == nil, release.sha256.range(of:"^[a-f0-9]{64}$",options:.regularExpression) != nil else { throw AppError.message("Некорректные сведения о релизе") }
         guard release.version.range(of:"^[0-9]+\\.[0-9]+\\.[0-9]+$",options:.regularExpression) != nil, release.build > 0 else { throw AppError.message("Некорректная версия релиза") }
         let parts = release.minimumOS.split(separator:".",omittingEmptySubsequences:false)
-        guard (1...3).contains(parts.count), parts.allSatisfy({Int($0) != nil}), let major = Int(parts[0]), major >= 10 else { throw AppError.message("Некорректная версия macOS") }
+        guard (1...3).contains(parts.count), parts.allSatisfy({ !$0.isEmpty && $0.allSatisfy { $0.isASCII && $0.isNumber } && Int($0) != nil }), let major = Int(parts[0]), major >= 10 else { throw AppError.message("Некорректная версия macOS") }
         let required = parts.map { Int($0)! }
         let minimum = OperatingSystemVersion(majorVersion:major,minorVersion:required.count > 1 ? required[1] : 0,patchVersion:required.count > 2 ? required[2] : 0)
         guard ProcessInfo.processInfo.isOperatingSystemAtLeast(minimum) else { throw AppError.message("Новая версия требует macOS \(release.minimumOS)") }
@@ -93,7 +93,7 @@ final class Updater {
             guard process.terminationStatus == 0 else { throw AppError.message("Пакет не прошёл проверку подписи или совместимости Intel/Apple Silicon") }
         }
         try verify("/usr/bin/codesign",["--verify","--deep","--strict",app.path])
-        for component in ["Contents/MacOS/AutoTurn","Contents/Library/LaunchServices/AutoTurnHelper","Contents/Resources/amneziawg-go"] {
+        for component in ["Contents/MacOS/AutoTurn","Contents/Library/LaunchServices/AutoTurnHelper","Contents/Resources/amneziawg-go","Contents/Resources/routing-core"] {
             try verify("/usr/bin/lipo",[app.appendingPathComponent(component).path,"-verify_arch","x86_64","arm64"])
         }
     }

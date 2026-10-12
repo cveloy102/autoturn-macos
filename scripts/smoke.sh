@@ -5,10 +5,11 @@ APP=${1:-"$ROOT/dist/AutoTurn.app"}
 ARCH=$(uname -m)
 case "$ARCH" in x86_64|arm64) ;; *) echo 'Unsupported test host'; exit 1;; esac
 /usr/bin/codesign --verify --deep --strict "$APP"
-for COMPONENT in Contents/MacOS/AutoTurn Contents/Library/LaunchServices/AutoTurnHelper Contents/Resources/amneziawg-go; do
+for COMPONENT in Contents/MacOS/AutoTurn Contents/Library/LaunchServices/AutoTurnHelper Contents/Resources/amneziawg-go Contents/Resources/routing-core; do
  /usr/bin/lipo "$APP/$COMPONENT" -verify_arch x86_64 arm64
  /usr/bin/otool -arch "$ARCH" -L "$APP/$COMPONENT"
 done
+"$APP/Contents/Resources/routing-core" version
 "$APP/Contents/Resources/amneziawg-go" --version
 "$APP/Contents/Library/LaunchServices/AutoTurnHelper" --self-check
 "$APP/Contents/MacOS/AutoTurn" --ui-self-check

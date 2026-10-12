@@ -18,8 +18,20 @@ let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UU
 try FileManager.default.createDirectory(at:directory,withIntermediateDirectories:true)
 defer { try? FileManager.default.removeItem(at:directory) }
 var physical = PhysicalNetwork(interface:"en0",gateway:"192.168.1.1",service:"test")
-let protection = GuardFake(), tunnel = TunnelFake()
-let service = Service(Installation(uid:501,cdhashes:[],engine:"unused"),protection:protection,managedTunnel:tunnel,physical:{physical},health:{_ in true},stateDirectory:directory.path,monitoring:false)
+final class RoutingFake: DomainRouting {
+ var configured: RoutingSettings?, stops = 0, rejectStart = false, tunnelChecks = 0
+ func configure(_ settings:RoutingSettings,physical:PhysicalNetwork) throws { configured = settings }
+ func setTunnel(_ interface:String?,dns:[String],supportsIPv6:Bool) throws {
+  tunnelChecks += 1
+  check(protection.active,"Routing core started before protection")
+  check(!supportsIPv6,"IPv4-only profile advertised IPv6 to routing core")
+  if rejectStart && configured?.mode == .rules { throw AppError.message("Test core failure") }
+ }
+ func stop() throws { stops += 1; configured = nil }
+ func recoverJournal() {}
+}
+let protection = GuardFake(), tunnel = TunnelFake(), routing = RoutingFake()
+let service = Service(Installation(uid:501,cdhashes:[],engine:"unused"),protection:protection,managedTunnel:tunnel,routing:routing,physical:{physical},health:{_ in true},stateDirectory:directory.path,monitoring:false)
 let key = Data(repeating:7,count:32).base64EncodedString()
 let profile = try Profile.parse("[Interface]\nPrivateKey=\(key)\nAddress=10.0.0.2/32\nDNS=1.1.1.1\n[Peer]\nPublicKey=\(key)\nEndpoint=198.51.100.10:1234\nAllowedIPs=0.0.0.0/0\n",name:"Test")
 var settings = Settings(); settings.profiles = [profile]; settings.selectedID = profile.id; settings.homeSSIDs = ["home"]
@@ -50,4 +62,45 @@ _ = configure(.on,"home"); protection.failRelease = true; response = configure(.
 check(response.status.phase == .error && !response.status.guardActive && !tunnel.running,"Cleanup failure swallowed or engine left running")
 protection.failRelease = false; service.tick()
 check(service.status.phase == .off && protection.token == nil,"Cleanup retry did not release token")
+settings.routing.mode = .rules
+settings.routing.rules = [RoutingRule(name:"YouTube",domains:["youtube.com"])]
+response = configure(.auto,"cafe")
+check(response.ok && routing.configured?.mode == .rules,"DNS routing not configured outside home")
+response = configure(.auto,"home")
+check(response.ok && routing.configured == nil && !tunnel.running && !protection.active,"Home left DNS routing running")
+response = configure(.on,"home")
+check(response.ok && routing.configured?.mode == .rules,"Manual on did not configure routing")
+let checksBeforeIdleTick = routing.tunnelChecks
+service.nextCheck = Date().addingTimeInterval(60)
+service.tick()
+check(routing.tunnelChecks > checksBeforeIdleTick,"Core recovery waited for the VPN health timer")
+check(protection.active && tunnel.running,"Idle core check lost VPN protection")
+response = configure(.off,"home")
+check(response.ok && routing.configured == nil,"Manual off left domain routing running")
+routing.rejectStart = true
+response = configure(.on,"home")
+check(!response.ok || response.status.phase == .error,"Routing core startup failure was hidden")
+check(response.status.guardActive && tunnel.running,"Routing core failure opened direct traffic")
+response = configure(.off,"home")
+check(response.status.phase == .off && !protection.active && !tunnel.running,"Off failed after routing core startup error")
+routing.rejectStart = false
+response = configure(.on,"home")
+let startCount = tunnel.starts
+settings.routing.databaseUpdatedAt = Date()
+response = configure(.on,"home")
+check(response.status.phase == .connected && tunnel.starts == startCount,"Database timestamp restarted the VPN")
+settings.routing.rules[0].domains.append("googlevideo.com")
+response = configure(.on,"home")
+check(response.status.phase == .connected && tunnel.starts == startCount + 1,"Changed routing rules were not applied")
+_ = configure(.off,"home")
 print("\(passed) service transition checks passed: startup at home, VPN path events, on/auto/off, gateway changes, cleanup ordering and retries. No system network changes.")
+
+response = configure(.on,"external")
+response = service.handle(RPCRequest(command:"recover",settings:nil,network:nil))
+check(response.ok && response.status.phase == .off && !protection.active && !tunnel.running,"Emergency recovery did not release network")
+check(service.settings.mode == .off && service.settings.profiles.count == 1 && !service.settings.routing.rules.isEmpty,"Emergency recovery lost profiles or routing rules")
+let matches = OwnedProcessRecovery.candidates("111 0 /Library/Application Support/AutoTurn/routing-core run -c /Library/Application Support/AutoTurn/routing-core.json\n112 501 /Library/Application Support/AutoTurn/amneziawg-go -f utun\n113 0 /tmp/routing-core run -c /tmp/config\n114 0 /Library/Application Support/AutoTurn/amneziawg-go -f utun\n")
+check(Set(matches.keys) == Set([Int32(111),Int32(114)]),"Recovery identified another user's or unrelated process")
+response = service.handle(RPCRequest(command:"recover",settings:nil,network:nil))
+check(response.ok && response.status.phase == .off,"Repeated emergency recovery failed")
+print("\(passed) checks including emergency recovery and owned-process selection passed")

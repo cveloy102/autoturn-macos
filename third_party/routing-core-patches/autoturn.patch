@@ -1,0 +1,107 @@
+diff --git a/common/sniff/quic.go b/common/sniff/quic.go
+index 4f6dcf0..c5bb82a 100644
+--- a/common/sniff/quic.go
++++ b/common/sniff/quic.go
+@@ -309,7 +309,7 @@ find:
+ 		metadata.SniffContext = fragments
+ 		return E.Cause1(ErrNeedMoreData, err)
+ 	}
+-	metadata.Domain = fingerprint.ServerName
++	metadata.Domain = autoTurnDomain(metadata, fingerprint.ServerName, fingerprint.Extensions)
+ 	for metadata.Client == "" {
+ 		if len(frameTypeList) == 1 {
+ 			metadata.Client = C.ClientFirefox
+diff --git a/common/sniff/quic_test.go b/common/sniff/quic_test.go
+index e2f5372..50606bd 100644
+--- a/common/sniff/quic_test.go
++++ b/common/sniff/quic_test.go
+@@ -29,7 +29,7 @@ func TestSniffQUICChromeNew(t *testing.T) {
+ 	require.NoError(t, err)
+ 	err = sniff.QUICClientHello(context.Background(), &metadata, pkt)
+ 	require.NoError(t, err)
+-	require.Equal(t, "www.google.com", metadata.Domain)
++	require.Empty(t, metadata.Domain, "ECH outer SNI must not authorize direct egress")
+ }
+ 
+ func TestSniffQUICChromium(t *testing.T) {
+@@ -45,7 +45,7 @@ func TestSniffQUICChromium(t *testing.T) {
+ 	require.NoError(t, err)
+ 	err = sniff.QUICClientHello(context.Background(), &metadata, pkt)
+ 	require.NoError(t, err)
+-	require.Equal(t, metadata.Domain, "google.com")
++	require.Empty(t, metadata.Domain, "ECH outer SNI must not authorize direct egress")
+ }
+ 
+ func TestSniffUQUICChrome115(t *testing.T) {
+@@ -69,7 +69,7 @@ func TestSniffQUICFirefox(t *testing.T) {
+ 	require.NoError(t, err)
+ 	require.Equal(t, metadata.Protocol, C.ProtocolQUIC)
+ 	require.Equal(t, metadata.Client, C.ClientFirefox)
+-	require.Equal(t, metadata.Domain, "www.google.com")
++	require.Empty(t, metadata.Domain, "ECH outer SNI must not authorize direct egress")
+ }
+ 
+ func TestSniffQUICSafari(t *testing.T) {
+diff --git a/common/sniff/tls.go b/common/sniff/tls.go
+index 613086e..81fac13 100644
+--- a/common/sniff/tls.go
++++ b/common/sniff/tls.go
+@@ -22,7 +22,7 @@ func TLSClientHello(ctx context.Context, metadata *adapter.InboundContext, reade
+ 	}).HandshakeContext(ctx)
+ 	if clientHello != nil {
+ 		metadata.Protocol = C.ProtocolTLS
+-		metadata.Domain = clientHello.ServerName
++		metadata.Domain = autoTurnDomain(metadata, clientHello.ServerName, clientHello.Extensions)
+ 		return nil
+ 	}
+ 	if errors.Is(err, io.ErrUnexpectedEOF) {
+diff --git a/dns/client.go b/dns/client.go
+index 77fe1cb..6ab87b5 100644
+--- a/dns/client.go
++++ b/dns/client.go
+@@ -201,7 +201,7 @@ func computeTimeToLive(response *dns.Msg) uint32 {
+ 	var timeToLive uint32
+ 	if len(response.Answer) == 0 {
+ 		if soaTTL, hasSOA := extractNegativeTTL(response); hasSOA {
+-			return soaTTL
++			return min(soaTTL, 21600)
+ 		}
+ 	}
+ 	for _, recordList := range [][]dns.RR{response.Answer, response.Ns, response.Extra} {
+@@ -214,7 +214,8 @@ func computeTimeToLive(response *dns.Msg) uint32 {
+ 			}
+ 		}
+ 	}
+-	return timeToLive
++	// AutoTurn: real DNS addresses expire in at most six hours.
++	return min(timeToLive, 21600)
+ }
+ 
+ func normalizeTTL(response *dns.Msg, timeToLive uint32) {
+diff --git a/route/route.go b/route/route.go
+index 8dddb04..68b9bea 100644
+--- a/route/route.go
++++ b/route/route.go
+@@ -573,6 +573,7 @@ func (r *Router) prepareMatchMetadata(ctx context.Context, metadata *adapter.Inb
+ 				Port: metadata.Destination.Port,
+ 			}
+ 			metadata.FakeIP = true
++			metadata.Inbound = "autoturn-domain"
+ 			r.logger.DebugContext(ctx, "found fakeip domain: ", domain)
+ 		}
+ 	} else if metadata.Domain == "" {
+diff --git a/route/rule/rule_item_domain.go b/route/rule/rule_item_domain.go
+index 7e6484e..591a793 100644
+--- a/route/rule/rule_item_domain.go
++++ b/route/rule/rule_item_domain.go
+@@ -60,7 +60,9 @@ func NewRawDomainItem(matcher *domain.Matcher) *DomainItem {
+ 
+ func (r *DomainItem) Match(metadata *adapter.InboundContext) bool {
+ 	var domainHost string
+-	if metadata.Domain != "" {
++	if metadata.FakeIP {
++		domainHost = metadata.Destination.Fqdn
++	} else if metadata.Domain != "" {
+ 		domainHost = metadata.Domain
+ 	} else {
+ 		domainHost = metadata.Destination.Fqdn

@@ -6,18 +6,18 @@
 	<string></string>
 	<key>CFBundleExecutable</key>
 	<string>AutoTurn</string>
-	<key>CFBundleIdentifier</key>
-	<string>ru.hl100.autoturn</string>
 	<key>CFBundleIconFile</key>
 	<string>AutoTurn.icns</string>
+	<key>CFBundleIdentifier</key>
+	<string>ru.hl100.autoturn</string>
 	<key>CFBundleName</key>
 	<string>AutoTurn</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.9</string>
+	<string>1.0.0</string>
 	<key>CFBundleVersion</key>
-	<string>10</string>
+	<string>100</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
 	<key>LSUIElement</key>

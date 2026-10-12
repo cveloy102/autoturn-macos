@@ -9,6 +9,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--key', type=Path, required=True)
 parser.add_argument('--init', action='store_true')
 parser.add_argument('--notes', type=Path)
+parser.add_argument('--archive', type=Path, help='Sign the exact CI archive; extract to dist/AutoTurn.app for validation first')
 args = parser.parse_args()
 root = Path(__file__).resolve().parent.parent
 if args.init:
@@ -28,11 +29,12 @@ info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
 public = base64.b64encode(key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)).decode()
 if info.get('ATUpdatePublicKey') != public: raise SystemExit('App update public key differs from signing key; rebuild first.')
 subprocess.run(['/usr/bin/codesign', '--verify', '--deep', '--strict', str(app)], check=True)
-for component in ('Contents/MacOS/AutoTurn', 'Contents/Library/LaunchServices/AutoTurnHelper', 'Contents/Resources/amneziawg-go'):
+for component in ('Contents/MacOS/AutoTurn', 'Contents/Library/LaunchServices/AutoTurnHelper', 'Contents/Resources/amneziawg-go', 'Contents/Resources/routing-core'):
     subprocess.run(['/usr/bin/lipo', str(app / component), '-verify_arch', 'x86_64', 'arm64'], check=True)
 version, build = info['CFBundleShortVersionString'], int(info['CFBundleVersion'])
-archive = root / f'dist/AutoTurn-{version}-macOS.zip'
-subprocess.run(['/usr/bin/ditto','-c','-k','--sequesterRsrc','--keepParent',str(app),str(archive)],check=True)
+archive = args.archive or root / f'dist/AutoTurn-{version}-macOS.zip'
+if archive.name != f'AutoTurn-{version}-macOS.zip': raise SystemExit('Unexpected archive filename.')
+if not args.archive: subprocess.run(['/usr/bin/ditto','-c','-k','--sequesterRsrc','--keepParent',str(app),str(archive)],check=True)
 data = archive.read_bytes()
 payload = json.dumps({'version':version,'build':build,'minimumOS':info['LSMinimumSystemVersion'],
     'archiveURL':f'https://github.com/cveloy102/autoturn-macos/releases/download/macos-v{version}/{archive.name}',

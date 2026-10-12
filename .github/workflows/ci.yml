@@ -16,15 +16,33 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.25.0'
+          go-version: '1.26.9'
           cache: false
       - name: Host architecture
         run: uname -m
       - name: Core and service tests
         run: bash scripts/test.sh
+      - name: Build patched routing core from source
+        run: bash scripts/prepare-routing-core.sh
       - name: Universal build
         run: bash scripts/build.sh
+      - name: Update bundle and bundled routing configuration checks
+        run: |
+          AT_TEST_BUNDLE="$PWD/dist/AutoTurn.app" .build/core-tests
+          AT_TEST_ROUTING_CORE="$PWD/dist/AutoTurn.app/Contents/Resources/routing-core" .build/audit-tests
       - name: Native app, helper, engine and IPC smoke
         run: bash scripts/smoke.sh
+      - name: Package release candidate and corresponding source
+        if: matrix.runner == 'macos-15-intel'
+        run: bash scripts/package-candidate.sh
+      - uses: actions/upload-artifact@v4
+        if: matrix.runner == 'macos-15-intel'
+        with:
+          name: macos-release-candidate
+          path: dist/candidate/*
+          retention-days: 30
+          compression-level: 0

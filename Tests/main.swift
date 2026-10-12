@@ -145,3 +145,96 @@ expect(!LoginRegistration.existing(in:loginTestDirectory),"explicit login Off wa
 try LoginRegistration.set(false,in:loginTestDirectory)
 expect(!FileManager.default.fileExists(atPath:loginFile.path),"login Off is not idempotent")
 print("\(passed) checks passed: AWG 3.1 parser, full tunnel, home policy, failover order, retries, update signatures, downgrade/host/OS rejection")
+
+let legacySettings = try JSONDecoder().decode(Settings.self,from:Data("{\"mode\":\"off\",\"homeSSIDs\":[\"Keen_5G\"],\"profiles\":[],\"launchAtLogin\":true}".utf8))
+expect(legacySettings.mode == .off && legacySettings.homeSSIDs == ["Keen_5G"] && legacySettings.launchAtLogin && legacySettings.routing.mode == .all,"Routing migration reset user settings")
+var routes = RoutingSettings(); routes.mode = .rules
+routes.rules = [RoutingRule(name:"YouTube",domains:["youtube.com","googlevideo.com"]),RoutingRule(name:"Specific direct",domains:["help.youtube.com"],destination:.direct)]
+expect(RoutingPolicy.destination(for:"r1.googlevideo.com",settings:routes) == .vpn,"Subdomain not matched")
+expect(RoutingPolicy.destination(for:"notyoutube.com",settings:routes) == .direct,"Domain suffix crossed label boundary")
+expect(RoutingPolicy.destination(for:"help.youtube.com",settings:routes) == .direct,"Specific direct rule ignored")
+routes.rules.append(RoutingRule(name:"Safe tie",domains:["help.youtube.com"]))
+expect(RoutingPolicy.destination(for:"help.youtube.com",settings:routes) == .vpn,"Equal rule conflict leaked VPN domain")
+expect(RoutingPolicy.contains("192.0.2.12",cidr:"192.0.2.0/24") && !RoutingPolicy.contains("192.0.3.12",cidr:"192.0.2.0/24"),"IPv4 subnet matching wrong")
+expect(RoutingPolicy.contains("2001:db8::1",cidr:"2001:db8::/32") && !RoutingPolicy.contains("2001:db9::1",cidr:"2001:db8::/32"),"IPv6 subnet matching wrong")
+for invalid in ["https://youtube.com/path","evil.example; pass all","a..example","127.0.0.1","-bad.example"] {
+ do { _ = try RoutingPolicy.normalizeDomain(invalid); fatalError("Invalid domain accepted") } catch { passed += 1 }
+}
+let normalizedDomain = try RoutingPolicy.normalizeDomain("*.Example.COM.")
+expect(normalizedDomain == "example.com","Domain normalization wrong")
+let imported = try RoutingExport.read(JSONEncoder().encode(RoutingExport(routing:routes)))
+expect(imported.rules == routes.rules,"Route import/export lost rules")
+let routeJSON = String(data:try JSONEncoder().encode(RoutingExport(routing:routes)),encoding:.utf8)!
+expect(!routeJSON.contains("privatekey") && !routeJSON.contains("profiles"),"Route export included VPN keys")
+expect(!RoutingPolicy.validSourcePath("../../secret") && RoutingPolicy.validSourcePath("source2/youtube.txt"),"Database source traversal allowed")
+let ipv4Core = try JSONSerialization.jsonObject(with:RoutingCoreConfiguration.make(routes,physicalInterface:"en0",gateway:"192.168.1.1",tunnel:"utun3",dns:"1.1.1.1")) as! [String:Any]
+let ipv4Inbounds = ipv4Core["inbounds"] as! [[String:Any]]
+expect(ipv4Inbounds[0]["address"] as? [String] == ["172.29.255.1/30"],"IPv4-only VPN falsely advertised IPv6 to Chrome")
+let dualCore = try JSONSerialization.jsonObject(with:RoutingCoreConfiguration.make(routes,physicalInterface:"en0",gateway:"192.168.1.1",tunnel:"utun3",dns:"1.1.1.1",supportsIPv6:true)) as! [String:Any]
+let dualInbounds = dualCore["inbounds"] as! [[String:Any]]
+expect((dualInbounds[0]["address"] as? [String])?.count == 2,"Dual-stack VPN lost IPv6 configuration")
+var telegramRoutes = RoutingSettings(); telegramRoutes.mode = .rules
+var telegramRule = RoutingRule(name:"Telegram",serviceID:"telegram",sourcePath:"source2/telegram.txt")
+telegramRule.baseDomains = try RoutingPolicy.parseList("# mixed upstream\n149.154.160.0/20\n2001:67c:4e8::/48\ntelegram.org\nt.me\n")
+telegramRule.ipRanges = ["192.0.2.0/24"]
+telegramRoutes.rules = [telegramRule]; telegramRoutes = try telegramRoutes.validated()
+expect(telegramRoutes.rules[0].baseDomains == ["t.me","telegram.org"],"Service IP ranges remained in domain list")
+expect(telegramRoutes.rules[0].allIPRanges.count == 3,"Service IP ranges or manual additions lost")
+expect(RoutingPolicy.addressDestination("149.154.167.51",settings:telegramRoutes) == .vpn,"Telegram IP not routed through VPN")
+let telegramConfig = try JSONSerialization.jsonObject(with:RoutingCoreConfiguration.make(telegramRoutes,physicalInterface:"en0",gateway:"192.168.1.1",tunnel:"utun3",dns:"1.1.1.1")) as! [String:Any]
+let routeConfig = telegramConfig["route"] as! [String:Any]
+expect(routeConfig["final"] as? String == "direct","Unselected or opaque traffic incorrectly defaults to VPN")
+let coreRules = routeConfig["rules"] as! [[String:Any]]
+expect(coreRules.contains { ($0["ip_cidr"] as? [String])?.contains("149.154.160.0/20") == true && $0["outbound"] as? String == "vpn" },"Imported service IP ranges absent from live core policy")
+let roundTrip = try RoutingExport.read(JSONEncoder().encode(RoutingExport(routing:telegramRoutes)))
+expect(roundTrip.rules == telegramRoutes.rules,"Export/import lost service IP ranges")
+let oldRule = try JSONDecoder().decode(RoutingRule.self,from:Data("{\"id\":\"00000000-0000-0000-0000-000000000001\",\"name\":\"Telegram\",\"baseDomains\":[\"149.154.160.0/20\",\"t.me\"],\"domains\":[],\"ipRanges\":[],\"destination\":\"vpn\",\"enabled\":true}".utf8))
+var oldRoutes = RoutingSettings(); oldRoutes.rules = [oldRule]
+let migratedRoutes = try oldRoutes.validated()
+expect(migratedRoutes.rules[0].allDomains == ["t.me"] && migratedRoutes.rules[0].allIPRanges == ["149.154.160.0/20"],"Old mixed service rule could not be migrated")
+print("\(passed) total checks including migration, domain/CIDR precedence, route export and input validation.")
+let projectRoot = URL(fileURLWithPath:#filePath).deletingLastPathComponent().deletingLastPathComponent()
+let seedData = try Data(contentsOf:projectRoot.appendingPathComponent("Resources/Routing/seed.json"))
+let seedJSON = try JSONSerialization.jsonObject(with:seedData) as! [String:Any]
+for seedService in seedJSON["services"] as! [[String:Any]] {
+ var item = RoutingRule(name:seedService["name"] as! String,serviceID:seedService["id"] as? String,sourcePath:seedService["sourcePath"] as? String)
+ item.baseDomains = seedService["domains"] as! [String]
+ var settings = RoutingSettings(); settings.rules = [item]
+ let accepted = try settings.validated()
+ expect(!accepted.rules[0].allDomains.isEmpty || !accepted.rules[0].allIPRanges.isEmpty,"Bundled service cannot be added")
+}
+print("\(passed) checks including every actual bundled service passed")
+let plainIPs = try RoutingIPImport.parse("# ChatGPT\n104.18.0.1\n2606:4700::/32\n104.18.0.1\n")
+expect(plainIPs.count == 1 && plainIPs[0].ranges == ["104.18.0.1/32","2606:4700::/32"],"IP-list import lost IPv6 or duplicate handling")
+let hydraIPs = try RoutingIPImport.parse("##ChatGPT\n/HydraRoute\n104.18.0.0/16\n\n##Disabled\n#/Other\n192.0.2.0/24\n\n##YouTube\n/Other\n203.0.113.1\n")
+expect(hydraIPs.count == 2 && hydraIPs[0].name.contains("ChatGPT") && !hydraIPs.flatMap { $0.ranges }.contains("192.0.2.0/24"),"Hydra import merged groups or imported disabled block")
+expect((try? RoutingIPImport.parse("chatgpt.com")) == nil,"Domain silently accepted as IP")
+expect((try? RoutingIPImport.parse("/VPN\ngeoip:ru")) == nil,"Unsupported GeoIP directive silently accepted")
+print("\(passed) checks including IP-list and Hydra block imports passed")
+
+for minimumOS in ["13.-1", "13.+1", "13.0.-1", "13..0"] {
+    var release = manifest; release.minimumOS = minimumOS
+    do { _ = try Updater.validateMetadata(sign(release),publicKey:signingKey.publicKey.rawRepresentation,installedBuild:1); fatalError("Invalid OS component accepted") } catch { passed += 1 }
+}
+// A correctly signed bundle must include a universal routing engine too.
+if let path = ProcessInfo.processInfo.environment["AT_TEST_BUNDLE"] {
+    let app = URL(fileURLWithPath:path)
+    let bundle = Bundle(url:app)!
+    var release = manifest
+    release.version = bundle.object(forInfoDictionaryKey:"CFBundleShortVersionString") as! String
+    release.build = Int(bundle.object(forInfoDictionaryKey:"CFBundleVersion") as! String)!
+    try Updater.validateBundle(app,release:release); passed += 1
+    let temporary = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at:temporary) }
+    try FileManager.default.createDirectory(at:temporary,withIntermediateDirectories:true)
+    let incomplete = temporary.appendingPathComponent("AutoTurn.app")
+    try FileManager.default.copyItem(at:app,to:incomplete)
+    try FileManager.default.removeItem(at:incomplete.appendingPathComponent("Contents/Resources/routing-core"))
+    let signer = Process(); signer.executableURL = URL(fileURLWithPath:"/usr/bin/codesign")
+    signer.arguments = ["--force","--sign","-","--identifier","ru.hl100.autoturn",incomplete.path]
+    signer.standardOutput = FileHandle.nullDevice; signer.standardError = FileHandle.nullDevice
+    try signer.run(); signer.waitUntilExit()
+    expect(signer.terminationStatus == 0,"Incomplete bundle fixture signing failed")
+    do { try Updater.validateBundle(incomplete,release:release); fatalError("Updater accepted a signed bundle missing routing-core") } catch { passed += 1 }
+}
+print("\(passed) shared checks including malformed OS versions and optional update bundle validation passed")
