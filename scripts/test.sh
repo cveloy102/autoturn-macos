@@ -16,3 +16,6 @@ sh -n "$ROOT/Resources/install-service.sh"
 
 "$SWIFTC" -sdk "$SDK" "$ROOT"/Sources/Shared/*.swift "$ROOT/Sources/Helper/Networking.swift" "$ROOT/Sources/Helper/DNSRouter.swift" "$ROOT/Sources/Helper/RoutingCore.swift" "$ROOT/Sources/Helper/OwnedProcessRecovery.swift" "$ROOT/Sources/Helper/Service.swift" "$ROOT/TestsService/main.swift" -framework Network -framework SystemConfiguration -o "$ROOT/.build/service-tests"
 "$ROOT/.build/service-tests"
+
+"$SWIFTC" -sdk "$SDK" "$ROOT"/Sources/Shared/*.swift "$ROOT/Sources/Helper/Networking.swift" "$ROOT/Sources/Helper/DNSRouter.swift" "$ROOT/Sources/Helper/RoutingCore.swift" "$ROOT/Sources/Helper/OwnedProcessRecovery.swift" "$ROOT/Sources/Helper/Service.swift" "$ROOT/TestsAudit/main.swift" -framework Network -framework SystemConfiguration -o "$ROOT/.build/audit-tests"
+"$ROOT/.build/audit-tests"

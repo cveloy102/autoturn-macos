@@ -28,5 +28,19 @@ jobs:
         run: bash scripts/prepare-routing-core.sh
       - name: Universal build
         run: bash scripts/build.sh
+      - name: Update bundle and bundled routing configuration checks
+        run: |
+          AT_TEST_BUNDLE="$PWD/dist/AutoTurn.app" .build/core-tests
+          AT_TEST_ROUTING_CORE="$PWD/dist/AutoTurn.app/Contents/Resources/routing-core" .build/audit-tests
       - name: Native app, helper, engine and IPC smoke
         run: bash scripts/smoke.sh
+      - name: Package release candidate and corresponding source
+        if: matrix.runner == 'macos-15-intel'
+        run: bash scripts/package-candidate.sh
+      - uses: actions/upload-artifact@v4
+        if: matrix.runner == 'macos-15-intel'
+        with:
+          name: macos-release-candidate
+          path: dist/candidate/*
+          retention-days: 30
+          compression-level: 0

@@ -77,7 +77,7 @@ final class Service {
             case "check": nextCheck = .distantPast; tick()
             case "next":
                 guard settings.profiles.count > 1 else { throw AppError.message("Нет резервного профиля") }
-                if settings.mode != .off { try guardManager.apply(tunnel: nil, profile: nil); guardRequired = true; saveGuard(); try tunnel.stop() }
+                if settings.mode != .off { try stopProtectedTunnel(physical: physicalRead()) }
                 index = Policy.next(index: index, count: settings.profiles.count); attempted = 0; failures = 0; nextCheck = .distantPast; tick()
             case "recover":
                 settings.mode = .off; pendingTunnelReset = false
@@ -93,7 +93,8 @@ final class Service {
             case "stop": settings.mode = .off; tick()
             default: throw AppError.message("Команда не поддерживается")
             }
-            return RPCResponse(ok: true, status: status, error: nil)
+            let failed = request.command != "status" && status.phase == .error
+            return RPCResponse(ok: !failed, status: status, error: failed ? status.message : nil)
         } catch {
             status.phase = .error; status.message = error.localizedDescription; status.guardActive = guardManager.active
             event(status.message); return RPCResponse(ok: false, status: status, error: status.message)
@@ -123,14 +124,18 @@ final class Service {
                     do { try tunnel.stop() } catch { if cleanupError == nil { cleanupError = error } }
                     guardRequired = guardManager.active; saveGuard(); event("Наш VPN отключён")
                 }
-                status.phase = cleanupError == nil ? (settings.mode == .off ? .off : .home) : .error
-                status.message = cleanupError?.localizedDescription ?? (settings.mode == .off ? "Выключено вручную · прямое подключение разрешено" : "Домашняя сеть · через роутер")
+                status.phase = cleanupError == nil ? (settings.mode == .off ? .off : settings.profiles.isEmpty ? .setup : .home) : .error
+                status.message = cleanupError?.localizedDescription ?? (settings.mode == .off ? "Выключено вручную · прямое подключение разрешено" : settings.profiles.isEmpty ? "Импортируй профиль AmneziaWG" : "Домашняя сеть · через роутер")
                 status.guardActive = guardManager.active; status.verifiedAt = nil; status.tunnel = nil; status.profileID = nil; status.profileName = nil
                 if let error = cleanupError { event(error.localizedDescription) }
                 return
             }
             guardRequired = true; saveGuard()
-            if (changed || pendingTunnelReset) && tunnel.running { try domainRoutes.stop(); try guardManager.configureRouting(RoutingSettings(),physical:physical); try guardManager.apply(tunnel: nil, profile: nil); try tunnel.stop(); event("Пересоздаём туннель после изменения сети или профиля") }
+            if ((changed || pendingTunnelReset) && tunnel.running) || (!tunnel.running && tunnel.interface != nil) {
+                try stopProtectedTunnel(physical: physical)
+                nextCheck = .distantPast
+                event("Пересоздаём туннель после изменения сети, профиля или остановки движка")
+            }
             pendingTunnelReset = false
             if !network.available || settings.profiles.isEmpty {
                 try guardManager.apply(tunnel: tunnel.running ? tunnel.interface : nil, profile: nil); saveGuard()
@@ -184,8 +189,16 @@ final class Service {
             attempted = 0; nextCheck = Date().addingTimeInterval(Policy.retryDelay(round: round)); round += 1
             status.message = "Все профили не отвечают. Держим VPN и повторяем попытки."; return
         }
-        do { try guardManager.apply(tunnel: nil, profile: nil); saveGuard(); try tunnel.stop(); index = Policy.next(index: index, count: settings.profiles.count); nextCheck = .distantPast; event("Переходим на резервный профиль") }
+        do { try stopProtectedTunnel(physical: observedPhysical); index = Policy.next(index: index, count: settings.profiles.count); nextCheck = .distantPast; event("Переходим на резервный профиль") }
         catch { status.phase = .error; status.message = error.localizedDescription; nextCheck = Date().addingTimeInterval(30) }
+    }
+    private func stopProtectedTunnel(physical: PhysicalNetwork) throws {
+        // Tighten PF before removing the core's physical sockets and old tunnel.
+        try guardManager.configureRouting(RoutingSettings(), physical: physical)
+        try guardManager.apply(tunnel: nil, profile: nil)
+        guardRequired = true; saveGuard()
+        try domainRoutes.stop()
+        try tunnel.stop()
     }
 }
 

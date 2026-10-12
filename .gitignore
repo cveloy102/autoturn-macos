@@ -2,6 +2,7 @@
 dist/
 work-engine-*/
 .DS_Store
+__pycache__/
 *.conf
 *.key
 *.private

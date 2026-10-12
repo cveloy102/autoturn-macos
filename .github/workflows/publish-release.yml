@@ -1,0 +1,88 @@
+name: Publish locally signed release
+on:
+  push:
+    branches: [main]
+    paths: ['releases/*/publish.json']
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: publish-macos
+  cancel-in-progress: false
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      manifest: ${{ steps.manifest.outputs.path }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - id: manifest
+        name: Locate one newly changed release manifest
+        run: |
+          mapfile -t files < <(git diff --name-only HEAD^ HEAD -- 'releases/*/publish.json')
+          test "${#files[@]}" -eq 1
+          test -f "${files[0]}"
+          echo "path=${files[0]}" >> "$GITHUB_OUTPUT"
+      - name: Require successful source build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MANIFEST: ${{ steps.manifest.outputs.path }}
+        run: |
+          run=$(jq -r '.runID' "$MANIFEST")
+          sha=$(jq -r '.commit' "$MANIFEST")
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run" > /tmp/run.json
+          jq -e --arg sha "$sha" '.conclusion == "success" and .head_sha == $sha and .path == ".github/workflows/ci.yml"' /tmp/run.json
+  archive:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-14, macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install cryptography==48.0.1
+      - name: Download exact candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MANIFEST: ${{ needs.prepare.outputs.manifest }}
+        run: |
+          run=$(python -c 'import json,os; print(json.load(open(os.environ["MANIFEST"]))["runID"])')
+          gh run download "$run" --repo "$GITHUB_REPOSITORY" --name macos-release-candidate --dir artifacts
+          python scripts/verify-release.py "$MANIFEST" artifacts
+          mkdir extracted
+          ditto -x -k artifacts/AutoTurn-*-macOS.zip extracted
+          python scripts/verify-release.py "$MANIFEST" artifacts --app extracted/AutoTurn.app
+      - name: Native smoke of exact signed release
+        run: bash scripts/smoke.sh "$PWD/extracted/AutoTurn.app"
+  publish:
+    needs: [prepare, archive]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install cryptography==48.0.1
+      - name: Publish verified assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MANIFEST: ${{ needs.prepare.outputs.manifest }}
+        run: |
+          run=$(jq -r '.runID' "$MANIFEST")
+          version=$(jq -r '.version' "$MANIFEST")
+          sha=$(jq -r '.commit' "$MANIFEST")
+          gh run download "$run" --repo "$GITHUB_REPOSITORY" --name macos-release-candidate --dir artifacts
+          python scripts/verify-release.py "$MANIFEST" artifacts
+          cp "$(dirname "$MANIFEST")/macos-update.json" artifacts/
+          (cd artifacts && sha256sum AutoTurn-* macos-update.json > SHA256SUMS.txt)
+          gh release create "macos-v$version" --repo "$GITHUB_REPOSITORY" --target "$sha" --title "AutoTurn $version — маршруты под вашим контролем" --notes-file "$(dirname "$MANIFEST")/notes.md" --latest artifacts/AutoTurn-* artifacts/macos-update.json artifacts/SHA256SUMS.txt

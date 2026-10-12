@@ -2,10 +2,14 @@ import Foundation
 import SystemConfiguration
 import Darwin
 
-// Explicit developer diagnostic. It does not read/write Keychain, login settings,
-// or database files. Only a profile path supplied on the command line is used.
+// Explicit developer diagnostic. It never writes Keychain, login settings or
+// database files. The caller supplies a parsed profile, from a file or Keychain.
 enum RoutingLiveCheck {
     static func run(profilePath: String) -> Int32 {
+        do { return run(profile: try Profile.parse(String(contentsOfFile:profilePath,encoding:.utf8),name:"Routing diagnostic")) }
+        catch { fputs("LIVE ROUTING CHECK FAILED: \(error.localizedDescription)\n",stderr); return 1 }
+    }
+    static func run(profile suppliedProfile: Profile) -> Int32 {
         func report(_ message: String) { print(message); fflush(stdout) }
         func require(_ condition: Bool, _ message: String) throws { if !condition { throw AppError.message(message) } }
         func request(_ command: String, settings: Settings? = nil, network: NetworkObservation? = nil) throws -> ServiceStatus {
@@ -41,7 +45,7 @@ enum RoutingLiveCheck {
             try require(!initial.guardActive && [.home,.off,.setup].contains(initial.phase),"Diagnostic requires an idle VPN at home or Off")
             guard let store = SCDynamicStoreCreate(nil,"AutoTurnRoutingCheck" as CFString,nil,nil), let global = SCDynamicStoreCopyValue(store,"State:/Network/Global/IPv4" as CFString) as? [String:Any], let iface = global["PrimaryInterface"] as? String, let gateway = global["Router"] as? String, !iface.hasPrefix("utun") else { throw AppError.message("No physical network") }
             let network = NetworkObservation(available:true,interface:iface,ssid:"AUTOTURN_SELF_CHECK_HOME",gateway:gateway)
-            var profile = try Profile.parse(String(contentsOfFile:profilePath,encoding:.utf8),name:"Routing diagnostic")
+            var profile = try suppliedProfile.validated()
             profile.resolvedIP = try Storage.resolve(profile.endpointHost)
             var settings = Settings(); settings.profiles = [profile]; settings.selectedID = profile.id; settings.mode = .on
             settings.homeSSIDs = ["AUTOTURN_SELF_CHECK_HOME"]

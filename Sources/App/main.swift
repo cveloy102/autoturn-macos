@@ -1147,6 +1147,13 @@ if CommandLine.arguments.contains("--recover-network-check") {
     do { let reply = try IPC.request(RPCRequest(command:"recover",settings:nil,network:nil)); guard reply.ok && reply.status.phase == .off && !reply.status.guardActive else { throw AppError.message(reply.error ?? "Network cleanup not confirmed") }; print("Emergency recovery confirmed: Off, guard released; saved settings untouched"); exit(0) }
     catch { fputs((error.localizedDescription + "\n"),stderr); exit(1) }
 }
+if CommandLine.arguments.contains("--routing-live-check-stored") {
+    do {
+        let settings = try Storage.load()
+        guard let profile = settings.profiles.first(where: { $0.id == settings.selectedID }) ?? settings.profiles.first else { throw AppError.message("Нет сохранённого VPN-профиля") }
+        exit(RoutingLiveCheck.run(profile:profile))
+    } catch { fputs("LIVE ROUTING CHECK FAILED: \(error.localizedDescription)\n",stderr); exit(1) }
+}
 if let index = CommandLine.arguments.firstIndex(of:"--routing-live-check"), index+1 < CommandLine.arguments.count {
     exit(RoutingLiveCheck.run(profilePath:CommandLine.arguments[index+1]))
 }

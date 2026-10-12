@@ -54,8 +54,13 @@ struct Profile: Codable, Equatable {
         let mtuText = iface.removeValue(forKey: "mtu") ?? "1280"
         guard let mtu = Int(mtuText), (1280...1500).contains(mtu) else { throw AppError.message("MTU должен быть от 1280 до 1500") }
         guard let endpoint = peer.removeValue(forKey: "endpoint"), let colon = endpoint.lastIndex(of: ":"), let port = Int(endpoint[endpoint.index(after: colon)...]), (1...65535).contains(port) else { throw AppError.message("Некорректный Endpoint") }
-        var host = String(endpoint[..<colon]); if host.hasPrefix("[") && host.hasSuffix("]") { host.removeFirst(); host.removeLast() }
-        guard !host.isEmpty, host.utf8.count <= 253, host.range(of: "^[A-Za-z0-9.:-]+$", options: .regularExpression) != nil else { throw AppError.message("Некорректный адрес сервера") }
+        var host = String(endpoint[..<colon])
+        if host.hasPrefix("[") && host.hasSuffix("]") {
+            host.removeFirst(); host.removeLast()
+            guard host.contains(":"), isIP(host) else { throw AppError.message("Некорректный IPv6 адрес сервера") }
+        } else {
+            guard !host.contains(":"), validEndpointHost(host) else { throw AppError.message("Некорректный адрес сервера") }
+        }
         let allowed = list(peer.removeValue(forKey: "allowedips") ?? "")
         guard !allowed.isEmpty, allowed.allSatisfy(validCIDR) else { throw AppError.message("Некорректный AllowedIPs") }
         // V1 deliberately routes all traffic; IPv6 is blocked when no IPv6 tunnel address exists.
@@ -109,8 +114,24 @@ struct Profile: Codable, Equatable {
     }
     private func hexKey(_ value: String) -> String { Data(base64Encoded: value)!.map { String(format:"%02x", $0) }.joined() }
     static func list(_ text: String) -> [String] { text.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) } }
-    static func isIP(_ text: String) -> Bool { var a = in_addr(), b = in6_addr(); return text.withCString { inet_pton(AF_INET, $0, &a) == 1 || inet_pton(AF_INET6, $0, &b) == 1 } }
-    static func validCIDR(_ text: String) -> Bool { let p = text.split(separator: "/"); guard p.count == 2, isIP(String(p[0])), let n = Int(p[1]) else { return false }; return (0...(p[0].contains(":") ? 128 : 32)).contains(n) }
+    static func isIP(_ text: String) -> Bool {
+        guard !text.utf8.contains(0) else { return false }
+        var a = in_addr(), b = in6_addr()
+        return text.withCString { inet_pton(AF_INET, $0, &a) == 1 || inet_pton(AF_INET6, $0, &b) == 1 }
+    }
+    static func validEndpointHost(_ text: String) -> Bool {
+        if isIP(text) { return true }
+        guard !text.isEmpty, text.utf8.count <= 253, !text.allSatisfy({ $0.isNumber || $0 == "." }) else { return false }
+        let name = text.hasSuffix(".") ? String(text.dropLast()) : text
+        return name.split(separator: ".", omittingEmptySubsequences: false).allSatisfy { label in
+            !label.isEmpty && label.utf8.count <= 63 && label.first != "-" && label.last != "-" && label.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-") }
+        }
+    }
+    static func validCIDR(_ text: String) -> Bool {
+        let p = text.split(separator: "/", omittingEmptySubsequences: false)
+        guard p.count == 2, isIP(String(p[0])), !p[1].isEmpty, p[1].allSatisfy({ $0.isASCII && $0.isNumber }), let n = Int(p[1]) else { return false }
+        return (0...(p[0].contains(":") ? 128 : 32)).contains(n)
+    }
 }
 
 struct Settings: Codable {

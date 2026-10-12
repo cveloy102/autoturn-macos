@@ -211,3 +211,30 @@ expect(hydraIPs.count == 2 && hydraIPs[0].name.contains("ChatGPT") && !hydraIPs.
 expect((try? RoutingIPImport.parse("chatgpt.com")) == nil,"Domain silently accepted as IP")
 expect((try? RoutingIPImport.parse("/VPN\ngeoip:ru")) == nil,"Unsupported GeoIP directive silently accepted")
 print("\(passed) checks including IP-list and Hydra block imports passed")
+
+for minimumOS in ["13.-1", "13.+1", "13.0.-1", "13..0"] {
+    var release = manifest; release.minimumOS = minimumOS
+    do { _ = try Updater.validateMetadata(sign(release),publicKey:signingKey.publicKey.rawRepresentation,installedBuild:1); fatalError("Invalid OS component accepted") } catch { passed += 1 }
+}
+// A correctly signed bundle must include a universal routing engine too.
+if let path = ProcessInfo.processInfo.environment["AT_TEST_BUNDLE"] {
+    let app = URL(fileURLWithPath:path)
+    let bundle = Bundle(url:app)!
+    var release = manifest
+    release.version = bundle.object(forInfoDictionaryKey:"CFBundleShortVersionString") as! String
+    release.build = Int(bundle.object(forInfoDictionaryKey:"CFBundleVersion") as! String)!
+    try Updater.validateBundle(app,release:release); passed += 1
+    let temporary = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at:temporary) }
+    try FileManager.default.createDirectory(at:temporary,withIntermediateDirectories:true)
+    let incomplete = temporary.appendingPathComponent("AutoTurn.app")
+    try FileManager.default.copyItem(at:app,to:incomplete)
+    try FileManager.default.removeItem(at:incomplete.appendingPathComponent("Contents/Resources/routing-core"))
+    let signer = Process(); signer.executableURL = URL(fileURLWithPath:"/usr/bin/codesign")
+    signer.arguments = ["--force","--sign","-","--identifier","ru.hl100.autoturn",incomplete.path]
+    signer.standardOutput = FileHandle.nullDevice; signer.standardError = FileHandle.nullDevice
+    try signer.run(); signer.waitUntilExit()
+    expect(signer.terminationStatus == 0,"Incomplete bundle fixture signing failed")
+    do { try Updater.validateBundle(incomplete,release:release); fatalError("Updater accepted a signed bundle missing routing-core") } catch { passed += 1 }
+}
+print("\(passed) shared checks including malformed OS versions and optional update bundle validation passed")

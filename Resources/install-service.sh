@@ -18,6 +18,11 @@ STAGE="$SUPPORT/stage-$$.app"
 /usr/sbin/chown -R root:wheel "$STAGE"
 /bin/chmod -R go-w "$STAGE"
 /usr/bin/codesign --verify --deep --strict "$STAGE"
+# Reject an incomplete or incompatible package before stopping the live helper.
+for COMPONENT in Contents/MacOS/AutoTurn Contents/Library/LaunchServices/AutoTurnHelper Contents/Resources/amneziawg-go Contents/Resources/routing-core; do
+ [ -x "$STAGE/$COMPONENT" ]
+ /usr/bin/lipo "$STAGE/$COMPONENT" -verify_arch "$(uname -m)"
+done
 HASHES=''
 for ARCH in x86_64 arm64; do
  HASH=$(/usr/bin/codesign --display --verbose=4 --arch "$ARCH" "$STAGE" 2>&1 | /usr/bin/awk -F= '/^CDHash=/{print $2}')
