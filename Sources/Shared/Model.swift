@@ -1,6 +1,17 @@
 import Foundation
 import Darwin
 
+// Unlike wall time or systemUptime, this clock includes time spent asleep and
+// cannot move backwards when macOS synchronizes its date after waking.
+enum ContinuousTime {
+    private static let scale: Double = {
+        var info = mach_timebase_info_data_t()
+        mach_timebase_info(&info)
+        return Double(info.numer) / Double(info.denom) / 1_000_000_000
+    }()
+    static func now() -> TimeInterval { Double(mach_continuous_time()) * scale }
+}
+
 enum AppError: Error, LocalizedError {
     case message(String)
     var errorDescription: String? { if case .message(let text) = self { return text }; return nil }
@@ -161,6 +172,7 @@ struct NetworkObservation: Codable {
     // Optional for compatibility with older installed apps. Never renew a lease
     // merely because an old observation finally reached the helper queue.
     var sampledAt: Date? = nil
+    var sampledContinuouslyAt: TimeInterval? = nil
 }
 struct ServiceStatus: Codable {
     var routingProtocol: Int? = 2

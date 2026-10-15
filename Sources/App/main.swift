@@ -166,6 +166,22 @@ final class ConsoleSurface: NSView {
 
 final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNotificationCenterDelegate {
     var settings = Settings(), status = ServiceStatus()
+    var settingsReadError: String?
+    var recoveryRequestedWhileLocked = false
+    func saveSettings() throws {
+        guard settingsReadError == nil else { throw AppError.message("Связка ключей недоступна. Сохранённые профили не изменены.") }
+        try Storage.save(settings)
+    }
+    func retrySettings() {
+        do {
+            var loaded = try Storage.load()
+            if recoveryRequestedWhileLocked { loaded.mode = .off }
+            settings = loaded; settingsReadError = nil; recoveryRequestedWhileLocked = false
+            do { try Storage.restoreLaunchAtLogin(&settings) } catch { showError(error) }
+            if settings.mode == .auto && !settings.homeSSIDs.isEmpty { observer.requestInitialPermission() }
+            persistAndConfigure(); buildPage(); observer.report()
+        } catch { settingsReadError = error.localizedDescription; buildPage() }
+    }
     var serviceAvailable = false, busy = false, checkingConnection = false, checkingUpdate = false, polling = false
     var window: NSWindow!, body = NSView(), page = NSStackView(), footer: NSTextField!
     var tab = "Соединение"
@@ -208,8 +224,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
         if let icon = ApplicationArtwork.icon { NSApp.applicationIconImage = icon }
         if !preview {
             do { settings = try Storage.load() }
-            catch { showError(error); NSApp.terminate(nil); return }
-            do { try Storage.restoreLaunchAtLogin(&settings) } catch { showError(error) }
+            catch { settingsReadError = error.localizedDescription }
+            if settingsReadError == nil { do { try Storage.restoreLaunchAtLogin(&settings) } catch { showError(error) } }
             updater.restoreCandidate()
         }
         buildWindow(); buildStatusItem()
@@ -281,14 +297,20 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
         body.subviews.forEach { $0.removeFromSuperview() }; page = stack(spacing:10); let scroll = StackScroll(page); pin(scroll,inside:body,inset:0)
         consoleProfileButtons = []; consoleEventsField = nil; connectionCheckField = nil
         connectionTitle = nil; connectionMessage = nil; connectionNetwork = nil; connectionProfile = nil; connectionGuard = nil
-        switch tab {
+        if let error = settingsReadError {
+            page.addArrangedSubview(label("Связка ключей недоступна_",size:22))
+            page.addArrangedSubview(label(error + "\nРазблокируй Связку ключей и повтори чтение. Сохранённые профили не изменены.",size:13,color:Palette.dim))
+            page.addArrangedSubview(label(connectionDescription(),size:13))
+            page.addArrangedSubview(ActionButton("Повторить чтение профилей",primary:true) { [weak self] in self?.retrySettings() })
+            page.addArrangedSubview(ActionButton("Восстановить обычный интернет") { [weak self] in self?.emergencyRestore() })
+        } else { switch tab {
         case "Маршруты": routingPage()
         case "Профили": profilesPage()
         case "Домашняя сеть": homePage()
         case "События": eventsPage()
         case "Настройки": settingsPage()
         default: connectionPage()
-        }
+        } }
         for view in page.arrangedSubviews where !(view is ActionButton) { view.widthAnchor.constraint(equalTo:page.widthAnchor).isActive = true }
         page.addArrangedSubview(NSView())
     }
@@ -634,7 +656,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
     func guardDescription() -> String { if !serviceAvailable { return FileManager.default.fileExists(atPath:"/Library/LaunchDaemons/ru.hl100.autoturn.helper.plist") ? "Состояние службы и блокировки не подтверждено" : "VPN-служба ещё не установлена; интернет не изменён" }; return status.guardActive && settings.routing.mode == .rules ? "Прямой доступ по правилам; выбранные сервисы защищены" : status.guardActive ? "Прямой трафик заблокирован" : "Блокировка прямого доступа выключена" }
     func selectedProfile() -> Profile? { settings.profiles.first { $0.id == settings.selectedID } ?? settings.profiles.first }
     func updateStatus() {
-        if !preview { observer.setAutomationActive(settings.mode == .auto && !settings.homeSSIDs.isEmpty && !settings.profiles.isEmpty) }
+        if !preview { observer.setAutomationActive(settingsReadError == nil && settings.mode == .auto && !settings.homeSSIDs.isEmpty && !settings.profiles.isEmpty) }
         let revision = menuRevision() + consoleAppearance.rawValue + (status.profileName ?? "") + status.events.suffix(2).joined(separator:"\n")
         guard renderedStatusRevision != revision else { return }
         renderedStatusRevision = revision
@@ -668,8 +690,9 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
     func emergencyRestore() {
         popover.performClose(nil)
         guard !recoveringNetwork else { return }; recoveringNetwork = true
+        if settingsReadError != nil { recoveryRequestedWhileLocked = true }
         settings.mode = .off
-        do { if !preview { try Storage.save(settings) } } catch { routingFeedback = "Режим выключен; сохранить настройки не удалось: " + error.localizedDescription }
+        do { if !preview { try saveSettings() } } catch { routingFeedback = "Режим выключен; сохранить настройки не удалось: " + error.localizedDescription }
         busy = true
         client.send(RPCRequest(command:"recover",settings:nil,network:nil)) { [weak self] result in
             guard let self = self else { return }; self.busy = false; self.accept(result,quiet:true); self.buildPage()
@@ -721,7 +744,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
         }
     }
     func persistAndConfigure() {
-        do { try Storage.save(settings) } catch { showError(error); return }
+        do { try saveSettings() } catch { showError(error); return }
         buildPage()
         guard serviceAvailable else { return }; busy = true
         client.send(RPCRequest(command:"configure",settings:settings,network:observer.snapshot())) { [weak self] result in self?.busy = false; self?.accept(result); self?.observer.report() }
@@ -729,6 +752,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
     func setMode(_ mode: Mode) {
         if mode == .off && !liveNetworkTest && !confirm("Отключить VPN?",detail:"Вне дома интернет сможет идти напрямую. Автоматика будет выключена до возврата в Авто.") { return }
         guard mode == .off || !settings.profiles.isEmpty else { tab = "Профили"; openWindow(); return }
+        if settingsReadError != nil { guard mode == .off else { openWindow(); return }; recoveryRequestedWhileLocked = true }
         settings.mode = mode
         if mode == .auto && !settings.homeSSIDs.isEmpty { observer.requestInitialPermission() }
         buildPage(); refreshOpenMenu()
@@ -740,7 +764,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
         client.send(request) { [weak self] result in
             guard let self = self else { return }
             self.accept(result); self.observer.report()
-            do { try Storage.save(self.settings) } catch { self.info("Режим применён к службе, но настройки не сохранены: " + error.localizedDescription) }
+            do { try self.saveSettings() } catch { self.info("Режим применён к службе, но настройки не сохранены: " + error.localizedDescription) }
             self.busy = false
         }
     }
@@ -752,11 +776,12 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
     func importProfiles(_ files:[URL]) {
         guard !busy, !files.isEmpty else { return }
         guard files.allSatisfy({ $0.isFileURL && $0.pathExtension.lowercased() == "conf" }) else { showError(AppError.message("Нужен файл AmneziaWG с расширением .conf")); return }
+        guard settingsReadError == nil else { openWindow(); return }
         busy = true
         DispatchQueue.global().async { let result = Result { try files.map { file -> Profile in var profile = try Profile.parse(String(contentsOf:file,encoding:.utf8),name:file.deletingPathExtension().lastPathComponent); profile.resolvedIP = try Storage.resolve(profile.endpointHost); return profile } }; DispatchQueue.main.async { self.busy = false; switch result { case .success(let profiles): guard self.settings.profiles.count + profiles.count <= 32 else { self.showError(AppError.message("Максимум 32 профиля")); return }; self.tab = "Профили"; self.settings.profiles += profiles; if self.settings.selectedID == nil { self.settings.selectedID = profiles.first?.id }; self.persistAndConfigure(); case .failure(let error):self.showError(error) } } }
     }
     func removeProfile(_ profile: Profile) { guard confirm("Удалить \(profile.name)?",detail:"Профиль будет удалён из Keychain приложения.") else { return }; settings.profiles.removeAll { $0.id == profile.id }; if settings.selectedID == profile.id { settings.selectedID = settings.profiles.first?.id }; if settings.profiles.isEmpty { settings.mode = .off }; persistAndConfigure() }
-    @objc func toggleLogin(_ sender: NSButton) { do { try Storage.setLaunchAtLogin(sender.state == .on); settings.launchAtLogin = sender.state == .on; try Storage.save(settings) } catch { sender.state = settings.launchAtLogin ? .on : .off; showError(error) } }
+    @objc func toggleLogin(_ sender: NSButton) { do { try Storage.setLaunchAtLogin(sender.state == .on); settings.launchAtLogin = sender.state == .on; try saveSettings() } catch { sender.state = settings.launchAtLogin ? .on : .off; showError(error) } }
     @objc func woke() { observer.report(); refresh(); checkAutomaticUpdates(); checkRoutingUpdates() }
     func installService() {
         guard !settings.profiles.isEmpty else { tab = "Профили"; openWindow(); return }
@@ -927,7 +952,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
         testTimer?.invalidate()
         if let error = error {
             testExitCode = 1; fputs("LIVE TEST FAILED: \(error)\n",stderr)
-            settings.mode = .off; try? Storage.save(settings)
+            settings.mode = .off; try? saveSettings()
             client.send(RPCRequest(command:"stop",settings:nil,network:nil)) { _ in NSApp.terminate(nil) }
         } else {
             print("LIVE APPLICATION TEST PASSED: on -> auto(home) -> on -> off -> auto(home), actual HTTPS in every mode. App and service used their normal configure/network paths. Final mode is auto at home."); fflush(stdout)
@@ -1097,6 +1122,11 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
         }
         stopPopoverMonitoring()
         require(localClickMonitor == nil && globalClickMonitor == nil && resignObserver == nil,"popover monitors leaked")
+        settingsReadError = "Simulated locked Keychain"; buildPage(); window.contentView?.layoutSubtreeIfNeeded()
+        require(buttons(body).contains { $0.title == "Повторить чтение профилей" },"locked Keychain lost retry action")
+        require(buttons(body).contains { $0.title == "Восстановить обычный интернет" },"locked Keychain lost emergency recovery")
+        do { try saveSettings(); require(false,"locked Keychain allowed overwriting unread settings") } catch {}
+        settingsReadError = nil; buildPage()
         let start = CFAbsoluteTimeGetCurrent()
         for _ in 0..<1000 { updateStatus() }
         let milliseconds = (CFAbsoluteTimeGetCurrent()-start)*1000/1000
@@ -1167,6 +1197,15 @@ if let index = CommandLine.arguments.firstIndex(of:"--validate-profile"), index+
         print("AmneziaWG profile validated, including helper transport and UAPI serialization. No keys printed, stored or sent; no network changes.")
         exit(0)
     } catch { fputs("Profile validation failed: \(error.localizedDescription)\n",stderr); exit(1) }
+}
+// Sanitized status for live sleep/wake checks; no keys, SSIDs or server IPs.
+if CommandLine.arguments.contains("--network-status") {
+    do {
+        let response = try IPC.request(RPCRequest(command:"status",settings:nil,network:nil))
+        let status = response.status
+        print("STATUS mode=\(status.mode.rawValue) phase=\(status.phase.rawValue) guard=\(status.guardActive) routingTUN=\(if_nametoindex("utun99") != 0) events=\(status.events.count)")
+        exit(response.ok ? 0 : 1)
+    } catch { fputs("Network status unavailable: \(error.localizedDescription)\n",stderr); exit(1) }
 }
 if CommandLine.arguments.contains("--recover-network-check") {
     do { let reply = try IPC.request(RPCRequest(command:"recover",settings:nil,network:nil)); guard reply.ok && reply.status.phase == .off && !reply.status.guardActive else { throw AppError.message(reply.error ?? "Network cleanup not confirmed") }; print("Emergency recovery confirmed: Off, guard released; saved settings untouched"); exit(0) }

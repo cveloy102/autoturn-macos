@@ -43,8 +43,9 @@ final class NetworkObserver: NSObject, CLLocationManagerDelegate {
     func report() { changed?(snapshot()) }
     func snapshot() -> NetworkObservation {
         let sampledAt = Date()
-        guard let store = SCDynamicStoreCreate(nil, "AutoTurnUI" as CFString, nil, nil), let global = SCDynamicStoreCopyValue(store, "State:/Network/Global/IPv4" as CFString) as? [String: Any], let iface = global["PrimaryInterface"] as? String, !iface.hasPrefix("utun") else { return NetworkObservation(available: false, interface: nil, ssid: nil, gateway: nil, sampledAt:sampledAt) }
+        let sampledContinuouslyAt = ContinuousTime.now()
+        guard let store = SCDynamicStoreCreate(nil, "AutoTurnUI" as CFString, nil, nil), let global = SCDynamicStoreCopyValue(store, "State:/Network/Global/IPv4" as CFString) as? [String: Any], let iface = global["PrimaryInterface"] as? String, !iface.hasPrefix("utun") else { return NetworkObservation(available: false, interface: nil, ssid: nil, gateway: nil, sampledAt:sampledAt, sampledContinuouslyAt:sampledContinuouslyAt) }
         let wireless = CWWiFiClient.shared().interface(withName: iface)
-        return NetworkObservation(available: true, interface: iface, ssid: wireless?.ssid(), gateway: global["Router"] as? String, sampledAt:sampledAt)
+        return NetworkObservation(available: true, interface: iface, ssid: wireless?.ssid(), gateway: global["Router"] as? String, sampledAt:sampledAt, sampledContinuouslyAt:sampledContinuouslyAt)
     }
 }

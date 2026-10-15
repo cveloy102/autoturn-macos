@@ -20,6 +20,9 @@ final class Service {
     var observedAt = Date.distantPast, observedPhysical = PhysicalNetwork()
     var confirmedNetwork: NetworkObservation?
     var confirmedAt = Date.distantPast
+    var observedContinuousAt = -Double.infinity, confirmedContinuousAt = -Double.infinity
+    private var previousWallTime: Date?
+    let continuousNow: () -> TimeInterval
     let now: () -> Date
     var cleanupPending = false
     var retryTunnelAfterBackoff = false
@@ -32,8 +35,8 @@ final class Service {
     let installation: Installation
     let timer: DispatchSourceTimer
     let monitor = NWPathMonitor()
-    init(_ installation: Installation, protection: TrafficProtection = TrafficGuard(), managedTunnel: ManagedTunnel = Tunnel(), routing: DomainRouting? = nil, physical: @escaping () -> PhysicalNetwork = PhysicalNetwork.read, health: ((String) -> Bool)? = nil, stateDirectory: String = support, monitoring: Bool = true, now: @escaping () -> Date = Date.init, recoverProcesses: @escaping () throws -> Void = OwnedProcessRecovery.stop) {
-        self.now = now
+    init(_ installation: Installation, protection: TrafficProtection = TrafficGuard(), managedTunnel: ManagedTunnel = Tunnel(), routing: DomainRouting? = nil, physical: @escaping () -> PhysicalNetwork = PhysicalNetwork.read, health: ((String) -> Bool)? = nil, stateDirectory: String = support, monitoring: Bool = true, now: @escaping () -> Date = Date.init, continuousNow: @escaping () -> TimeInterval = ContinuousTime.now, recoverProcesses: @escaping () throws -> Void = OwnedProcessRecovery.stop) {
+        self.now = now; self.continuousNow = continuousNow
         self.recoverProcesses = recoverProcesses
         self.installation = installation; domainRoutes = routing ?? RoutingCoreManager(protection:protection,directory:stateDirectory); guardManager = protection; tunnel = managedTunnel; physicalRead = physical; healthCheck = health; self.stateDirectory = stateDirectory
         let historyURL = URL(fileURLWithPath:stateDirectory + "/events.json")
@@ -50,7 +53,9 @@ final class Service {
         if monitoring && stateDirectory == support {
             do { try recoverProcesses() } catch { startupRecoveryError = error; status.phase = .error; status.message = error.localizedDescription }
         }
-        domainRoutes.recoverJournal(); tunnel.recoverJournal()
+        do { try domainRoutes.recoverJournal() } catch { startupRecoveryError = error }
+        do { try tunnel.recoverJournal() } catch { startupRecoveryError = error }
+        if let error = startupRecoveryError { status.phase = .error; status.message = error.localizedDescription; cleanupPending = true }
         timer.schedule(deadline: monitoring ? .now() : .now() + 3600, repeating: monitoring ? 5 : 3600)
         timer.setEventHandler { [weak self] in self?.tick() }; timer.resume()
         monitor.pathUpdateHandler = { [weak self] _ in guard let self = self else { return }; self.queue.async { self.physicalNetworkChanged() } }
@@ -64,20 +69,27 @@ final class Service {
         // path changes must not defeat health-check backoff or force rebuilds.
         tick()
     }
-    func recordNetwork(_ value: NetworkObservation) {
+    @discardableResult func recordNetwork(_ value: NetworkObservation) -> Bool {
         let receivedAt = now(), sampledAt = value.sampledAt ?? receivedAt
+        let receivedContinuous = continuousNow()
+        let wallAge = receivedAt.timeIntervalSince(sampledAt)
+        let sampleContinuous = value.sampledContinuouslyAt ?? (receivedContinuous - max(0,wallAge))
         // Ignore queued/out-of-order observations, including samples from before
         // sleep. A future timestamp must not extend the trust window.
         guard sampledAt <= receivedAt.addingTimeInterval(2), receivedAt.timeIntervalSince(sampledAt) < 20,
-              sampledAt >= observedAt else { return }
+              wallAge >= -2, sampleContinuous.isFinite,
+              sampleContinuous <= receivedContinuous + 2, receivedContinuous - sampleContinuous < 20,
+              sampleContinuous >= observedContinuousAt else { return false }
         if !value.available || value.interface != observation.interface || value.gateway != observation.gateway ||
             (value.ssid != nil && value.ssid != confirmedNetwork?.ssid) {
-            confirmedNetwork = nil; confirmedAt = .distantPast
+            confirmedNetwork = nil; confirmedAt = .distantPast; confirmedContinuousAt = -Double.infinity
         }
         observation = value; observedAt = min(sampledAt,receivedAt)
+        observedContinuousAt = min(sampleContinuous,receivedContinuous)
         if value.available, value.ssid != nil {
-            confirmedNetwork = value; confirmedAt = observedAt
+            confirmedNetwork = value; confirmedAt = observedAt; confirmedContinuousAt = observedContinuousAt
         }
+        return true
     }
     func event(_ text: String) {
         guard text != lastEventText else { return }; lastEventText = text
@@ -109,9 +121,8 @@ final class Service {
                 event("Настройки применены"); tick()
             case "network":
                 guard let value = request.network else { throw AppError.message("Нет состояния сети") }
-                let changed = value.ssid != observation.ssid || value.interface != observation.interface || value.available != observation.available
-                recordNetwork(value)
-                if changed { nextCheck = .distantPast }; tick()
+                let changed = (value.ssid != nil && value.ssid != confirmedNetwork?.ssid) || value.interface != observation.interface || value.gateway != observation.gateway || value.available != observation.available
+                if recordNetwork(value) && changed { nextCheck = .distantPast }; tick()
             case "check": nextCheck = .distantPast; tick()
             case "next":
                 guard settings.profiles.count > 1 else { throw AppError.message("Нет резервного профиля") }
@@ -124,7 +135,8 @@ final class Service {
                 do { try domainRoutes.stop() } catch { errors.append(error.localizedDescription) }
                 do { try tunnel.stop() } catch { errors.append(error.localizedDescription) }
                 if stateDirectory == support { do { try recoverProcesses() } catch { errors.append(error.localizedDescription) } }
-                domainRoutes.recoverJournal(); tunnel.recoverJournal()
+                do { try domainRoutes.recoverJournal() } catch { errors.append(error.localizedDescription) }
+                do { try tunnel.recoverJournal() } catch { errors.append(error.localizedDescription) }
                 guardRequired = guardManager.active; saveGuard()
                 cleanupPending = !errors.isEmpty
                 guard errors.isEmpty else { throw AppError.message(errors.joined(separator:". ")) }
@@ -140,20 +152,29 @@ final class Service {
         }
     }
     func tick() {
+        let wallTime = now()
+        // Older clients only stamp wall time. Invalidate their leases on a
+        // backwards adjustment; new continuous timestamps remain ordered.
+        if let previous = previousWallTime, wallTime < previous {
+            observedAt = .distantPast; confirmedAt = .distantPast
+            observedContinuousAt = -Double.infinity; confirmedContinuousAt = -Double.infinity
+            confirmedNetwork = nil; nextCheck = .distantPast
+        }
+        previousWallTime = wallTime
         let physical = physicalRead()
         let changed = physical.interface != observedPhysical.interface || physical.gateway != observedPhysical.gateway
         if changed {
-            if observation.interface != physical.interface || observation.gateway != physical.gateway { observedAt = .distantPast }
-            if confirmedNetwork?.interface != physical.interface || confirmedNetwork?.gateway != physical.gateway { confirmedNetwork = nil; confirmedAt = .distantPast }
+            if observation.interface != physical.interface || observation.gateway != physical.gateway { observedAt = .distantPast; observedContinuousAt = -Double.infinity }
+            if confirmedNetwork?.interface != physical.interface || confirmedNetwork?.gateway != physical.gateway { confirmedNetwork = nil; confirmedAt = .distantPast; confirmedContinuousAt = -Double.infinity }
             nextCheck = .distantPast
         }
         observedPhysical = physical
         var network = NetworkObservation(available: physical.available, interface: physical.interface, ssid: nil, gateway: physical.gateway)
         // SSID lease is only accepted for the current physical interface, never a stale home Wi-Fi.
-        if now().timeIntervalSince(observedAt) < 20 && observation.interface == physical.interface && observation.gateway == physical.gateway { network.ssid = observation.ssid }
+        if (0..<20).contains(continuousNow() - observedContinuousAt) && observation.interface == physical.interface && observation.gateway == physical.gateway { network.ssid = observation.ssid }
         // A single nil SSID read must not immediately turn a confirmed home into
         // an external network. Do not renew this bounded lease on nil samples.
-        if network.ssid == nil, network.available, now().timeIntervalSince(confirmedAt) < 20,
+        if network.ssid == nil, network.available, (0..<20).contains(continuousNow() - confirmedContinuousAt),
            let confirmed = confirmedNetwork, confirmed.interface == physical.interface, confirmed.gateway == physical.gateway {
             network.ssid = confirmed.ssid
         }
@@ -171,6 +192,7 @@ final class Service {
         do {
             if !wanted {
                 pendingTunnelReset = false; retryTunnelAfterBackoff = false
+                failures = 0; attempted = 0; round = 0; nextCheck = .distantPast
                 var cleanupError: Error?
                 if cleanupPending || startupRecoveryError != nil || tunnel.running || tunnel.interface != nil || guardManager.active || guardRequired || guardManager.token != nil {
                     // Once direct Internet is requested, release PF before stopping
@@ -179,7 +201,7 @@ final class Service {
                     do { try domainRoutes.stop() } catch { if cleanupError == nil { cleanupError = error } }
                     do { try tunnel.stop() } catch { if cleanupError == nil { cleanupError = error } }
                     if startupRecoveryError != nil {
-                        do { try recoverProcesses(); startupRecoveryError = nil }
+                        do { try recoverProcesses(); try domainRoutes.recoverJournal(); try tunnel.recoverJournal(); startupRecoveryError = nil }
                         catch { if cleanupError == nil { cleanupError = error } }
                     }
                     guardRequired = guardManager.active; saveGuard(); event("Наш VPN отключён")

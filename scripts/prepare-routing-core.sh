@@ -1,5 +1,6 @@
 #!/bin/bash
 set -euo pipefail
+export GOTOOLCHAIN=${GOTOOLCHAIN:-go1.26.9}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 DEST="$ROOT/third_party/routing-core"
 GO=${AT_GO:-go}

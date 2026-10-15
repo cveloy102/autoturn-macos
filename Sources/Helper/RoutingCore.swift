@@ -9,9 +9,7 @@ final class RoutingCoreManager: DomainRouting {
     var coreInterface: String?, fingerprint = ""
     init(protection: TrafficProtection, directory: String = support) { self.protection = protection; self.directory = directory; executable = directory + "/routing-core" }
     private let dnsKey = "State:/Network/Service/AutoTurn-Routing/DNS"
-    func recoverJournal() {
-        if let store = SCDynamicStoreCreate(nil,"AutoTurnRoutingDNS" as CFString,nil,nil) { SCDynamicStoreRemoveValue(store,dnsKey as CFString) }
-    }
+    func recoverJournal() throws { try Tunnel.removeDNSKey(dnsKey) }
     private func installDNS() throws {
         guard let store = SCDynamicStoreCreate(nil,"AutoTurnRoutingDNS" as CFString,nil,nil) else { throw AppError.message("DNS маршрутов недоступен") }
         let value: [String:Any] = ["ServerAddresses":["172.29.255.2"],"SupplementalMatchDomains":[""],"SupplementalMatchOrders":[0],"InterfaceName":"utun99"]
@@ -48,17 +46,18 @@ final class RoutingCoreManager: DomainRouting {
     }
     func stop() throws { try stopProcess(); settings = RoutingSettings() }
     private func stopProcess() throws {
-        if let store = SCDynamicStoreCreate(nil,"AutoTurnRoutingDNS" as CFString,nil,nil), SCDynamicStoreCopyValue(store,dnsKey as CFString) != nil {
-            guard SCDynamicStoreRemoveValue(store,dnsKey as CFString) else { throw AppError.message("Не удалось убрать DNS маршрутов") }
-        }
+        var dnsError: Error?
+        do { try Tunnel.removeDNSKey(dnsKey) } catch { dnsError = error }
+
         try protection.setRoutingInterface(nil)
         if let p = process, p.isRunning {
-            p.terminate(); let deadline = Date().addingTimeInterval(2)
-            while p.isRunning && Date() < deadline { Thread.sleep(forTimeInterval:0.025) }
+            p.terminate(); let deadline = ContinuousTime.now() + 2
+            while p.isRunning && ContinuousTime.now() < deadline { Thread.sleep(forTimeInterval:0.025) }
             if p.isRunning { kill(p.processIdentifier,SIGKILL) }
-            let end = Date().addingTimeInterval(1); while p.isRunning && Date() < end { Thread.sleep(forTimeInterval:0.025) }
+            let end = ContinuousTime.now() + 1; while p.isRunning && ContinuousTime.now() < end { Thread.sleep(forTimeInterval:0.025) }
             guard !p.isRunning else { throw AppError.message("Ядро маршрутов не остановилось") }
         }
         process = nil; coreInterface = nil; fingerprint = ""
+        if let error = dnsError { throw error }
     }
 }

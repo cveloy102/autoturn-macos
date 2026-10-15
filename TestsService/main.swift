@@ -120,7 +120,7 @@ let leaseGuard = GuardFake(), leaseTunnel = TunnelFake(), leaseRoutes = LeaseRou
 var healthy = true, probes = 0, ownedRecoveryFails = false
 let leaseDirectory = directory.appendingPathComponent("lease")
 try FileManager.default.createDirectory(at:leaseDirectory,withIntermediateDirectories:true)
-let leaseService = Service(Installation(uid:501,cdhashes:[],engine:"unused"),protection:leaseGuard,managedTunnel:leaseTunnel,routing:leaseRoutes,physical:{leasePhysical},health:{_ in probes += 1; return healthy},stateDirectory:leaseDirectory.path,monitoring:false,now:{clock},recoverProcesses:{ if ownedRecoveryFails { throw AppError.message("Owned process still running") } })
+let leaseService = Service(Installation(uid:501,cdhashes:[],engine:"unused"),protection:leaseGuard,managedTunnel:leaseTunnel,routing:leaseRoutes,physical:{leasePhysical},health:{_ in probes += 1; return healthy},stateDirectory:leaseDirectory.path,monitoring:false,now:{clock},continuousNow:{clock.timeIntervalSince1970},recoverProcesses:{ if ownedRecoveryFails { throw AppError.message("Owned process still running") } })
 var leaseSettings = settings; leaseSettings.mode = .auto
 func leaseSample(_ ssid:String?, at date:Date? = nil) -> NetworkObservation {
  NetworkObservation(available:true,interface:leasePhysical.interface,ssid:ssid,gateway:leasePhysical.gateway,sampledAt:date ?? clock)
@@ -137,7 +137,8 @@ check(probes == probesBeforePath,"VPN path notifications defeated health-check b
 _ = leaseNetwork(leaseSample("home")); clock += 21
 check(leaseNetwork(leaseSample(nil)).status.phase != .home && leaseGuard.active,"Nil samples extended home trust indefinitely")
 _ = leaseNetwork(leaseSample("home")); clock += 21
-check(leaseNetwork(leaseSample("home",at:clock.addingTimeInterval(-21))).status.phase != .home,"Delayed queued home sample acquired a fresh lease")
+let delayedReply = leaseNetwork(leaseSample("home",at:clock.addingTimeInterval(-21)))
+check(delayedReply.status.phase != .home,"Delayed queued home sample acquired a fresh lease")
 _ = leaseNetwork(leaseSample("home")); clock += 1
 _ = leaseNetwork(leaseSample("cafe"))
 check(leaseNetwork(leaseSample("home",at:clock.addingTimeInterval(-0.5))).status.phase != .home,"Out-of-order home sample replaced newer external sample")
@@ -176,3 +177,77 @@ let permissions = try FileManager.default.attributesOfItem(atPath:leaseDirectory
 check(permissions?.intValue == 0o600,"Persistent diagnostic events are not private")
 _ = leaseService.handle(RPCRequest(command:"stop",settings:nil,network:nil))
 print("\(passed) checks including home lease expiry, transient nil SSID, delayed samples, cleanup retries, single-profile reconnect and persistent history passed")
+
+// Sleep advances the continuous clock even when the wall clock is corrected.
+var wallClock = Date(timeIntervalSince1970:1_800_000_000), elapsedClock: TimeInterval = 1000
+let wakeGuard = GuardFake(), wakeTunnel = TunnelFake()
+let wakeService = Service(Installation(uid:501,cdhashes:[],engine:"unused"),protection:wakeGuard,managedTunnel:wakeTunnel,routing:LeaseRoutes(),physical:{leasePhysical},health:{_ in true},stateDirectory:directory.path,monitoring:false,now:{wallClock},continuousNow:{elapsedClock})
+var wakeSettings = leaseSettings; wakeSettings.mode = .auto
+func wakeSample(_ ssid:String?, age:TimeInterval = 0) -> NetworkObservation {
+ NetworkObservation(available:true,interface:leasePhysical.interface,ssid:ssid,gateway:leasePhysical.gateway,sampledAt:wallClock.addingTimeInterval(-age),sampledContinuouslyAt:elapsedClock-age)
+}
+_ = wakeService.handle(RPCRequest(command:"configure",settings:wakeSettings,network:wakeSample("home")))
+elapsedClock += 600; wallClock -= 3600; wakeService.tick()
+check(wakeService.status.phase != .home && wakeGuard.active,"Clock rollback after sleep extended old home trust")
+_ = wakeService.handle(RPCRequest(command:"network",settings:nil,network:wakeSample("home")))
+check(wakeService.status.phase == .home && !wakeGuard.active,"Fresh home after clock rollback was rejected")
+elapsedClock += 21 // Wall time stays still, as it can when corrected after sleep.
+wakeService.tick()
+check(wakeService.status.phase != .home && wakeGuard.active,"Lease expiry depended on wall-clock progress")
+_ = wakeService.handle(RPCRequest(command:"network",settings:nil,network:wakeSample("home",age:600)))
+check(wakeService.status.phase != .home,"Pre-sleep sample reacquired home trust")
+_ = wakeService.handle(RPCRequest(command:"network",settings:nil,network:wakeSample("home")))
+elapsedClock += 3; wallClock += 3
+_ = wakeService.handle(RPCRequest(command:"network",settings:nil,network:wakeSample(nil)))
+let deadlineAfterNil = wakeService.nextCheck
+for _ in 0..<20 {
+ _ = wakeService.handle(RPCRequest(command:"network",settings:nil,network:wakeSample("cafe",age:30)))
+}
+check(wakeService.status.phase == .home && wakeService.nextCheck == deadlineAfterNil,"Rejected events changed home policy or retry deadline")
+// Unknown SSID must neither extend home trust nor defeat a retry backoff.
+healthy = false; leaseSettings.mode = .on
+_ = leaseService.handle(RPCRequest(command:"configure",settings:leaseSettings,network:leaseSample("cafe")))
+let scheduledProbe = leaseService.nextCheck, probesAtBackoff = probes
+_ = leaseNetwork(leaseSample(nil))
+_ = leaseNetwork(leaseSample("cafe"))
+_ = leaseNetwork(leaseSample("home",at:clock.addingTimeInterval(-30)))
+check(probes == probesAtBackoff && leaseService.nextCheck == scheduledProbe,"Transient or rejected SSID samples defeated health backoff")
+_ = leaseService.handle(RPCRequest(command:"stop",settings:nil,network:nil))
+_ = wakeService.handle(RPCRequest(command:"stop",settings:nil,network:nil))
+print("\(passed) checks including continuous sleep lease, clock rollback and rejected-observation backoff passed")
+
+// Cross every mode/routing/link state with every other state. These are service
+// transitions with the production decision code, not separate policy replicas.
+let matrixGuard = GuardFake(), matrixTunnel = TunnelFake(), matrixRoutes = LeaseRoutes()
+var matrixPhysical = PhysicalNetwork(interface:"en0",gateway:"192.168.1.1",service:"matrix")
+let matrixService = Service(Installation(uid:501,cdhashes:[],engine:"unused"),protection:matrixGuard,managedTunnel:matrixTunnel,routing:matrixRoutes,physical:{matrixPhysical},health:{_ in true},stateDirectory:directory.path,monitoring:false,now:{clock},continuousNow:{clock.timeIntervalSince1970})
+let modes: [Mode] = [.auto,.on,.off]
+let routingModes: [RoutingMode] = [.all,.rules]
+let links: [String?] = ["home","cafe",nil,"offline"]
+var matrixTransitions = 0
+func applyMatrix(_ mode:Mode,_ route:RoutingMode,_ link:String?) {
+ clock += 1
+ matrixPhysical = link == "offline" ? PhysicalNetwork() : PhysicalNetwork(interface:"en0",gateway:"192.168.1.1",service:"matrix")
+ var candidate = settings; candidate.mode = mode; candidate.routing.mode = route
+ let sample = NetworkObservation(available:matrixPhysical.available,interface:matrixPhysical.interface,ssid:link == "offline" ? nil : link,gateway:matrixPhysical.gateway,sampledAt:clock,sampledContinuouslyAt:clock.timeIntervalSince1970)
+ let reply = matrixService.handle(RPCRequest(command:"configure",settings:candidate,network:sample))
+ check(reply.ok,"Matrix transition returned an unexpected error")
+ if mode == .off || (mode == .auto && link == "home") {
+  check(!matrixGuard.active && !matrixTunnel.running && reply.status.phase == (mode == .off ? .off : .home),"Matrix direct transition left VPN or protection active")
+ } else if link == "offline" {
+  check(matrixGuard.active && reply.status.phase == .waiting,"Matrix disconnected transition lost protection")
+ } else if mode == .on || link == "cafe" {
+  check(matrixGuard.active && matrixTunnel.running && reply.status.phase == .connected,"Matrix VPN transition failed to connect under protection")
+ } else {
+  check((reply.status.phase == .home && !matrixGuard.active && !matrixTunnel.running) || (reply.status.phase == .connected && matrixGuard.active && matrixTunnel.running),"Matrix unknown SSID produced inconsistent status")
+ }
+ matrixTransitions += 1
+}
+for firstMode in modes { for firstRoute in routingModes { for firstLink in links {
+ for secondMode in modes { for secondRoute in routingModes { for secondLink in links {
+  applyMatrix(firstMode,firstRoute,firstLink)
+  applyMatrix(secondMode,secondRoute,secondLink)
+ } } }
+} } }
+_ = matrixService.handle(RPCRequest(command:"stop",settings:nil,network:nil))
+print("\(passed) service checks passed, including \(matrixTransitions) mode/routing/link transitions")

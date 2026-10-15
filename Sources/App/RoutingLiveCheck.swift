@@ -64,7 +64,21 @@ enum RoutingLiveCheck {
             let home = try wait(.home)
             try require(!home.guardActive && if_nametoindex("utun99") == 0,"Home transition did not clean TUN/PF")
             try require(https("https://www.apple.com/library/test/success.html"),"Direct HTTPS failed after home transition")
+            try require(https("https://www.cloudflare.com/cdn-cgi/trace"),"Previously VPN-routed domain failed after returning home")
             report("PASS home policy: physical interface unchanged, simulated trusted home SSID; TUN removed and HTTPS works")
+            // Exercise repeated transitions, including the same cached domain,
+            // without persisting any diagnostic settings.
+            for cycle in 1...3 {
+                settings.mode = .on
+                _ = try request("configure",settings:settings,network:network)
+                _ = try wait(.connected)
+                try require(https("https://www.cloudflare.com/cdn-cgi/trace"),"Repeated VPN HTTPS failed")
+                settings.mode = .auto
+                _ = try request("configure",settings:settings,network:network)
+                _ = try wait(.home)
+                try require(if_nametoindex("utun99") == 0 && https("https://www.cloudflare.com/cdn-cgi/trace"),"Repeated home cleanup failed")
+                report("PASS repeated rules/home transition \(cycle): same domain HTTPS works")
+            }
             settings.mode = .on; settings.routing.mode = .all
             _ = try request("configure",settings:settings,network:network)
             _ = try wait(.connected)
