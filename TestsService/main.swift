@@ -104,3 +104,72 @@ check(Set(matches.keys) == Set([Int32(111),Int32(114)]),"Recovery identified ano
 response = service.handle(RPCRequest(command:"recover",settings:nil,network:nil))
 check(response.ok && response.status.phase == .off,"Repeated emergency recovery failed")
 print("\(passed) checks including emergency recovery and owned-process selection passed")
+
+// Deterministic lease, sleep-sized gaps, cleanup and retry regressions. No waits
+// or real PF/routes/Keychain access; the service clock is supplied by the test.
+final class LeaseRoutes: DomainRouting {
+ var failStop = false, stops = 0
+ func configure(_ settings: RoutingSettings, physical: PhysicalNetwork) throws {}
+ func setTunnel(_ interface: String?, dns: [String], supportsIPv6: Bool) throws {}
+ func recoverJournal() {}
+ func stop() throws { stops += 1; if failStop { throw AppError.message("DNS cleanup failed") } }
+}
+var clock = Date(timeIntervalSince1970:1_800_000_000)
+var leasePhysical = PhysicalNetwork(interface:"en0",gateway:"192.168.1.1",service:"lease-test")
+let leaseGuard = GuardFake(), leaseTunnel = TunnelFake(), leaseRoutes = LeaseRoutes()
+var healthy = true, probes = 0
+let leaseDirectory = directory.appendingPathComponent("lease")
+try FileManager.default.createDirectory(at:leaseDirectory,withIntermediateDirectories:true)
+let leaseService = Service(Installation(uid:501,cdhashes:[],engine:"unused"),protection:leaseGuard,managedTunnel:leaseTunnel,routing:leaseRoutes,physical:{leasePhysical},health:{_ in probes += 1; return healthy},stateDirectory:leaseDirectory.path,monitoring:false,now:{clock})
+var leaseSettings = settings; leaseSettings.mode = .auto
+func leaseSample(_ ssid:String?, at date:Date? = nil) -> NetworkObservation {
+ NetworkObservation(available:true,interface:leasePhysical.interface,ssid:ssid,gateway:leasePhysical.gateway,sampledAt:date ?? clock)
+}
+func leaseNetwork(_ sample:NetworkObservation) -> RPCResponse { leaseService.handle(RPCRequest(command:"network",settings:nil,network:sample)) }
+_ = leaseService.handle(RPCRequest(command:"configure",settings:leaseSettings,network:leaseSample("home")))
+clock += 3
+check(leaseNetwork(leaseSample(nil)).status.phase == .home && !leaseGuard.active,"One nil SSID immediately blocked home internet")
+clock += 3
+check(leaseNetwork(leaseSample("cafe")).status.phase == .connected,"A known external SSID retained home trust")
+let probesBeforePath = probes
+for _ in 0..<10 { leaseService.physicalNetworkChanged() }
+check(probes == probesBeforePath,"VPN path notifications defeated health-check backoff")
+_ = leaseNetwork(leaseSample("home")); clock += 21
+check(leaseNetwork(leaseSample(nil)).status.phase != .home && leaseGuard.active,"Nil samples extended home trust indefinitely")
+_ = leaseNetwork(leaseSample("home")); clock += 21
+check(leaseNetwork(leaseSample("home",at:clock.addingTimeInterval(-21))).status.phase != .home,"Delayed queued home sample acquired a fresh lease")
+_ = leaseNetwork(leaseSample("home")); clock += 1
+_ = leaseNetwork(leaseSample("cafe"))
+check(leaseNetwork(leaseSample("home",at:clock.addingTimeInterval(-0.5))).status.phase != .home,"Out-of-order home sample replaced newer external sample")
+check(leaseNetwork(leaseSample("home",at:clock.addingTimeInterval(60))).status.phase != .home,"Future timestamp extended home trust")
+_ = leaseNetwork(leaseSample("home")); leasePhysical.gateway = "192.168.2.1"
+leaseService.physicalNetworkChanged()
+check(leaseService.status.phase != .home && leaseGuard.active,"Gateway change retained a cached home SSID")
+_ = leaseNetwork(leaseSample("home")); leasePhysical = PhysicalNetwork()
+leaseService.physicalNetworkChanged()
+check(leaseService.status.phase == .waiting && leaseGuard.active,"Physical disconnect retained direct home access")
+leasePhysical = PhysicalNetwork(interface:"en0",gateway:"192.168.1.1",service:"lease-test")
+_ = leaseNetwork(leaseSample("cafe")); leaseRoutes.failStop = true
+check(leaseNetwork(leaseSample("home")).status.phase == .error,"Routing cleanup failure was hidden")
+let failedStops = leaseRoutes.stops; leaseRoutes.failStop = false; leaseService.tick()
+check(leaseService.status.phase == .home && leaseRoutes.stops == failedStops+1,"Home failed to retry routing cleanup after guard and AWG stopped")
+leaseService.startupRecoveryError = AppError.message("Simulated startup recovery error")
+check(leaseService.handle(RPCRequest(command:"stop",settings:nil,network:nil)).status.phase == .off,"Startup error prevented explicit Off")
+leaseService.startupRecoveryError = nil
+leaseSettings.mode = .on; healthy = false
+_ = leaseService.handle(RPCRequest(command:"configure",settings:leaseSettings,network:leaseSample("cafe")))
+for _ in 0..<2 { _ = leaseService.handle(RPCRequest(command:"check",settings:nil,network:nil)) }
+let startsBeforeRetry = leaseTunnel.starts
+leaseService.tick()
+check(leaseTunnel.starts == startsBeforeRetry,"Single-profile retry skipped its backoff")
+clock += 31; leaseService.tick()
+check(leaseTunnel.starts == startsBeforeRetry+1 && leaseGuard.active,"Single-profile retry never recreated the unresponsive tunnel")
+healthy = true; clock += 11; leaseService.tick()
+check(leaseService.status.phase == .connected,"Single-profile retry did not recover")
+let restoredService = Service(Installation(uid:501,cdhashes:[],engine:"unused"),protection:GuardFake(),managedTunnel:TunnelFake(),routing:LeaseRoutes(),physical:{leasePhysical},health:{_ in true},stateDirectory:leaseDirectory.path,monitoring:false,now:{clock})
+check(restoredService.status.events.contains { $0.contains("повторные проверки") },"Restart discarded the failure history")
+check(restoredService.status.events.count <= 100,"Persistent history grew beyond the diagnostic limit")
+let permissions = try FileManager.default.attributesOfItem(atPath:leaseDirectory.appendingPathComponent("events.json").path)[.posixPermissions] as? NSNumber
+check(permissions?.intValue == 0o600,"Persistent diagnostic events are not private")
+_ = leaseService.handle(RPCRequest(command:"stop",settings:nil,network:nil))
+print("\(passed) checks including home lease expiry, transient nil SSID, delayed samples, cleanup retries, single-profile reconnect and persistent history passed")
