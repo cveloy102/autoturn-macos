@@ -176,6 +176,7 @@ struct NetworkObservation: Codable {
 }
 struct ServiceStatus: Codable {
     var routingProtocol: Int? = 2
+    var serviceInstance: String? = nil
     var phase: Phase = .setup
     var mode: Mode = .auto
     var profileID: String?

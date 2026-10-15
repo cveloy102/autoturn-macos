@@ -251,3 +251,57 @@ for firstMode in modes { for firstRoute in routingModes { for firstLink in links
 } } }
 _ = matrixService.handle(RPCRequest(command:"stop",settings:nil,network:nil))
 print("\(passed) service checks passed, including \(matrixTransitions) mode/routing/link transitions")
+
+// Model a health probe that stays in flight across Home/Off/profile replacement.
+// The callback is explicitly delivered later, then the production queue drains.
+var asyncCompletions: [(Bool) -> Void] = []
+let asyncGuard = GuardFake(), asyncTunnel = TunnelFake()
+let asyncService = Service(Installation(uid:501,cdhashes:[],engine:"unused"),protection:asyncGuard,managedTunnel:asyncTunnel,routing:LeaseRoutes(),physical:{leasePhysical},asyncHealth:{ _,_,done in asyncCompletions.append(done) },stateDirectory:directory.path,monitoring:false,now:{clock},continuousNow:{clock.timeIntervalSince1970})
+var asyncSettings = settings; asyncSettings.mode = .on
+func asyncConfigure(_ mode:Mode) -> RPCResponse {
+ asyncSettings.mode = mode
+ return asyncService.handle(RPCRequest(command:"configure",settings:asyncSettings,network:leaseSample("home")))
+}
+check(asyncConfigure(.on).status.phase == .connecting && asyncCompletions.count == 1,"Asynchronous health blocked initial configure")
+asyncService.tick(); asyncService.tick()
+check(asyncCompletions.count == 1,"Concurrent duplicate health probes were started")
+check(asyncConfigure(.auto).status.phase == .home && !asyncGuard.active,"Pending health probe delayed a fresh home observation")
+asyncCompletions[0](true); asyncService.queue.sync {}
+check(asyncService.status.phase == .home && !asyncGuard.active,"Late success revived VPN after Home")
+_ = asyncConfigure(.on)
+check(asyncService.handle(RPCRequest(command:"stop",settings:nil,network:nil)).status.phase == .off,"Pending health probe delayed Stop")
+asyncCompletions[1](false); asyncService.queue.sync {}
+check(asyncService.status.phase == .off && !asyncGuard.active,"Late failure changed Off into recovery")
+_ = asyncConfigure(.on)
+let oldCompletion = asyncCompletions.last!
+asyncSettings.selectedID = nil
+_ = asyncConfigure(.on)
+oldCompletion(false); asyncService.queue.sync {}
+check(asyncService.status.phase == .connecting,"An obsolete configuration probe changed the new connection")
+asyncCompletions.last!(true); asyncService.queue.sync {}
+check(asyncService.status.phase == .connected && asyncGuard.active,"Current async success did not verify the protected connection")
+clock += 31; asyncService.tick()
+let pendingCount = asyncCompletions.count
+for _ in 0..<6 { clock += 5; asyncService.tick() }
+check(asyncService.status.phase == .recovering && asyncCompletions.count == pendingCount,"Unanswered async health probe was not timed out")
+asyncCompletions.last!(true); asyncService.queue.sync {}
+check(asyncService.status.phase == .recovering,"Timed-out health callback revived an obsolete connection")
+_ = asyncService.handle(RPCRequest(command:"stop",settings:nil,network:nil))
+print("\(passed) service checks including nonblocking health, stale callbacks and probe timeout passed")
+
+check(service.status.serviceInstance != nil && service.status.serviceInstance != leaseService.status.serviceInstance,"Helper restart identity was not unique")
+let instanceRoundTrip = try JSONDecoder().decode(ServiceStatus.self,from:JSONEncoder().encode(service.status))
+check(instanceRoundTrip.serviceInstance == service.status.serviceInstance,"Helper restart identity did not survive IPC coding")
+print("\(passed) service checks including helper restart identity passed")
+
+_ = wakeService.handle(RPCRequest(command:"configure",settings:wakeSettings,network:wakeSample("home")))
+let wakeStarts = wakeTunnel.starts
+elapsedClock += 60; wallClock += 60; wakeService.tick()
+check(wakeService.status.phase == .waiting && wakeGuard.active && wakeTunnel.starts == wakeStarts,"Wake grace constructed VPN before the app could report fresh home")
+_ = wakeService.handle(RPCRequest(command:"network",settings:nil,network:wakeSample("home")))
+check(wakeService.status.phase == .home && !wakeGuard.active && wakeTunnel.starts == wakeStarts,"Fresh post-wake home did not cancel protected grace immediately")
+elapsedClock += 60; wallClock += 60; wakeService.tick()
+elapsedClock += 4; wallClock += 4; wakeService.tick()
+check(wakeService.status.phase == .connected && wakeGuard.active,"Unknown Wi-Fi after wake grace failed to require VPN")
+_ = wakeService.handle(RPCRequest(command:"stop",settings:nil,network:nil))
+print("\(passed) service checks including protected wake grace and unknown-network fallback passed")

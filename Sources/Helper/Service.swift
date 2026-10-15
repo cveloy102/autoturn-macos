@@ -13,6 +13,9 @@ final class Service {
     let domainRoutes: DomainRouting
     let physicalRead: () -> PhysicalNetwork
     let healthCheck: ((String) -> Bool)?
+    let asyncHealth: ((String, [String]?, @escaping (Bool) -> Void) -> Void)?
+    private var healthProbeToken: UUID?
+    private var healthProbeStarted: TimeInterval = 0
     let recoverProcesses: () throws -> Void
     let stateDirectory: String
     var settings = Settings(), status = ServiceStatus()
@@ -22,6 +25,8 @@ final class Service {
     var confirmedAt = Date.distantPast
     var observedContinuousAt = -Double.infinity, confirmedContinuousAt = -Double.infinity
     private var previousWallTime: Date?
+    private var previousTickContinuous: TimeInterval?
+    private var wakeGraceUntil: TimeInterval = -Double.infinity
     let continuousNow: () -> TimeInterval
     let now: () -> Date
     var cleanupPending = false
@@ -35,8 +40,8 @@ final class Service {
     let installation: Installation
     let timer: DispatchSourceTimer
     let monitor = NWPathMonitor()
-    init(_ installation: Installation, protection: TrafficProtection = TrafficGuard(), managedTunnel: ManagedTunnel = Tunnel(), routing: DomainRouting? = nil, physical: @escaping () -> PhysicalNetwork = PhysicalNetwork.read, health: ((String) -> Bool)? = nil, stateDirectory: String = support, monitoring: Bool = true, now: @escaping () -> Date = Date.init, continuousNow: @escaping () -> TimeInterval = ContinuousTime.now, recoverProcesses: @escaping () throws -> Void = OwnedProcessRecovery.stop) {
-        self.now = now; self.continuousNow = continuousNow
+    init(_ installation: Installation, protection: TrafficProtection = TrafficGuard(), managedTunnel: ManagedTunnel = Tunnel(), routing: DomainRouting? = nil, physical: @escaping () -> PhysicalNetwork = PhysicalNetwork.read, health: ((String) -> Bool)? = nil, asyncHealth: ((String, [String]?, @escaping (Bool) -> Void) -> Void)? = nil, stateDirectory: String = support, monitoring: Bool = true, now: @escaping () -> Date = Date.init, continuousNow: @escaping () -> TimeInterval = ContinuousTime.now, recoverProcesses: @escaping () throws -> Void = OwnedProcessRecovery.stop) {
+        self.now = now; self.continuousNow = continuousNow; self.asyncHealth = asyncHealth
         self.recoverProcesses = recoverProcesses
         self.installation = installation; domainRoutes = routing ?? RoutingCoreManager(protection:protection,directory:stateDirectory); guardManager = protection; tunnel = managedTunnel; physicalRead = physical; healthCheck = health; self.stateDirectory = stateDirectory
         let historyURL = URL(fileURLWithPath:stateDirectory + "/events.json")
@@ -44,6 +49,7 @@ final class Service {
            let data = try? Data(contentsOf:historyURL), let history = try? JSONDecoder().decode([String].self,from:data) {
             status.events = Array(history.suffix(100))
         }
+        status.serviceInstance = UUID().uuidString
         observedPhysical = physical()
         timer = DispatchSource.makeTimerSource(queue: queue)
         if let saved = try? JSONDecoder().decode(SavedGuard.self, from: Data(contentsOf: URL(fileURLWithPath: stateDirectory + "/guard.json"))) {
@@ -114,6 +120,7 @@ final class Service {
                 guard Set(value.profiles.map { $0.id }).count == value.profiles.count else { throw AppError.message("Повторные профили") }
                 if value.mode != .off && value.profiles.isEmpty { throw AppError.message("Сначала импортируй профиль") }
                 let changed = value.profiles != settings.profiles || value.selectedID != settings.selectedID || value.routing.mode != settings.routing.mode || (value.routing.mode == .rules && value.routing.rules != settings.routing.rules)
+                cancelHealthProbe()
                 settings = value
                 if let network = request.network { recordNetwork(network) }
                 if changed { index = value.profiles.firstIndex { $0.id == value.selectedID } ?? 0; pendingTunnelReset = true }
@@ -129,6 +136,7 @@ final class Service {
                 if settings.mode != .off { try stopProtectedTunnel(physical: physicalRead()) }
                 index = Policy.next(index: index, count: settings.profiles.count); attempted = 0; failures = 0; nextCheck = .distantPast; tick()
             case "recover":
+                cancelHealthProbe()
                 settings.mode = .off; pendingTunnelReset = false
                 var errors: [String] = []
                 do { try guardManager.remove() } catch { errors.append(error.localizedDescription) }
@@ -152,7 +160,13 @@ final class Service {
         }
     }
     func tick() {
-        let wallTime = now()
+        let wallTime = now(), continuousTime = continuousNow()
+        if let previous = previousTickContinuous, continuousTime - previous > 20 {
+            // Protect immediately, but let the app deliver a fresh post-wake SSID
+            // before expensive tunnel construction occupies this queue.
+            cancelHealthProbe(); wakeGraceUntil = continuousTime + 3; nextCheck = .distantPast
+        }
+        previousTickContinuous = continuousTime
         // Older clients only stamp wall time. Invalidate their leases on a
         // backwards adjustment; new continuous timestamps remain ordered.
         if let previous = previousWallTime, wallTime < previous {
@@ -164,6 +178,7 @@ final class Service {
         let physical = physicalRead()
         let changed = physical.interface != observedPhysical.interface || physical.gateway != observedPhysical.gateway
         if changed {
+            cancelHealthProbe()
             if observation.interface != physical.interface || observation.gateway != physical.gateway { observedAt = .distantPast; observedContinuousAt = -Double.infinity }
             if confirmedNetwork?.interface != physical.interface || confirmedNetwork?.gateway != physical.gateway { confirmedNetwork = nil; confirmedAt = .distantPast; confirmedContinuousAt = -Double.infinity }
             nextCheck = .distantPast
@@ -191,6 +206,7 @@ final class Service {
         }
         do {
             if !wanted {
+                cancelHealthProbe()
                 pendingTunnelReset = false; retryTunnelAfterBackoff = false
                 failures = 0; attempted = 0; round = 0; nextCheck = .distantPast
                 var cleanupError: Error?
@@ -215,6 +231,13 @@ final class Service {
             }
             if let error = startupRecoveryError { throw error }
             guardRequired = true; saveGuard()
+            if settings.mode == .auto && network.ssid == nil && continuousTime < wakeGraceUntil {
+                try guardManager.configureRouting(RoutingSettings(),physical:physical)
+                try guardManager.apply(tunnel:tunnel.running ? tunnel.interface : nil,profile:nil); saveGuard()
+                status.phase = .waiting; status.guardActive = guardManager.active; status.verifiedAt = nil
+                status.message = "Проверяем домашнюю сеть после сна. Защита включена."
+                return
+            }
             if ((changed || pendingTunnelReset || (retryTunnelAfterBackoff && now() >= nextCheck)) && tunnel.running) || (!tunnel.running && tunnel.interface != nil) {
                 try stopProtectedTunnel(physical: physical)
                 retryTunnelAfterBackoff = false
@@ -223,6 +246,7 @@ final class Service {
             }
             pendingTunnelReset = false
             if !network.available || settings.profiles.isEmpty {
+                cancelHealthProbe()
                 try guardManager.apply(tunnel: tunnel.running ? tunnel.interface : nil, profile: nil); saveGuard()
                 status.phase = .waiting; status.message = settings.profiles.isEmpty ? "Ожидаем профили от приложения. Прямой доступ закрыт." : "Ждём сеть. Режим VPN сохранён."; status.guardActive = guardManager.active; status.verifiedAt = nil; return
             }
@@ -251,17 +275,47 @@ final class Service {
             try domainRoutes.setTunnel(tunnel.interface,dns:profile.dns,supportsIPv6:profile.hasIPv6)
             try guardManager.apply(tunnel:tunnel.interface,profile:profile)
             status.tunnel = tunnel.interface; status.guardActive = guardManager.active
-            if let iface = tunnel.interface, (healthCheck?(iface) ?? HealthProbe.check(tunnel:iface,dns:settings.routing.mode == .rules ? profile.dns : nil)) {
-                let wasConnected = status.phase == .connected
-                status.phase = .connected; status.message = settings.routing.mode == .rules ? "VPN подключён · маршруты по доменам" : "VPN подключён · трафик проверен"; status.verifiedAt = now()
-                failures = 0; attempted = 0; round = 0; retryTunnelAfterBackoff = false; nextCheck = now().addingTimeInterval(30)
-                if !wasConnected { event("\(profile.name): доступ через VPN подтверждён") }
-            } else { connectionFailed(immediate: false) }
+            if let iface = tunnel.interface {
+                probeHealth(interface:iface,dns:settings.routing.mode == .rules ? profile.dns : nil)
+            } else { connectionFailed(immediate:false) }
         } catch {
+            cancelHealthProbe()
             if settings.routing.mode == .rules { try? guardManager.configureRouting(RoutingSettings(),physical:physical); try? guardManager.apply(tunnel:tunnel.interface,profile:settings.profiles.isEmpty ? nil : settings.profiles[index % settings.profiles.count]); saveGuard() }
             status.phase = .error; status.message = error.localizedDescription; status.guardActive = guardManager.active; status.verifiedAt = nil
             nextCheck = now().addingTimeInterval(30); event(status.message)
         }
+    }
+    private func cancelHealthProbe() { healthProbeToken = nil }
+    private func probeHealth(interface: String, dns: [String]?) {
+        if let health = healthCheck, asyncHealth == nil { completeHealthProbe(health(interface)); return }
+        if healthProbeToken != nil {
+            if continuousNow() - healthProbeStarted >= 30 {
+                cancelHealthProbe(); connectionFailed(immediate:false)
+            }
+            return
+        }
+        let token = UUID(); healthProbeToken = token; healthProbeStarted = continuousNow()
+        let completion: (Bool) -> Void = { [weak self] healthy in
+            guard let self = self else { return }
+            self.queue.async {
+                // A slow pre-wake/old-profile result must not revive VPN after
+                // Home, Off, recovery, a disconnect or tunnel replacement.
+                guard self.healthProbeToken == token, self.tunnel.interface == interface else { return }
+                self.healthProbeToken = nil
+                self.completeHealthProbe(healthy)
+            }
+        }
+        if let check = asyncHealth { check(interface,dns,completion) }
+        else { DispatchQueue.global(qos:.utility).async { completion(HealthProbe.check(tunnel:interface,dns:dns)) } }
+    }
+    private func completeHealthProbe(_ healthy: Bool) {
+        guard healthy else { connectionFailed(immediate:false); return }
+        let wasConnected = status.phase == .connected
+        status.phase = .connected
+        status.message = settings.routing.mode == .rules ? "VPN подключён · маршруты по доменам" : "VPN подключён · трафик проверен"
+        status.verifiedAt = now(); failures = 0; attempted = 0; round = 0
+        retryTunnelAfterBackoff = false; nextCheck = now().addingTimeInterval(30)
+        if !wasConnected { event("\(status.profileName ?? "Профиль"): доступ через VPN подтверждён") }
     }
     private func connectionFailed(immediate: Bool) {
         failures += immediate ? 3 : 1
@@ -279,6 +333,7 @@ final class Service {
         catch { status.phase = .error; status.message = error.localizedDescription; nextCheck = now().addingTimeInterval(30) }
     }
     private func stopProtectedTunnel(physical: PhysicalNetwork) throws {
+        cancelHealthProbe()
         // Tighten PF before removing the core's physical sockets and old tunnel.
         try guardManager.configureRouting(RoutingSettings(), physical: physical)
         try guardManager.apply(tunnel: nil, profile: nil)

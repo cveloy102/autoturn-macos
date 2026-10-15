@@ -166,6 +166,7 @@ final class ConsoleSurface: NSView {
 
 final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNotificationCenterDelegate {
     var settings = Settings(), status = ServiceStatus()
+    var configuredServiceInstance: String?
     var settingsReadError: String?
     var recoveryRequestedWhileLocked = false
     func saveSettings() throws {
@@ -682,7 +683,22 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
             fflush(stdout)
         }
     }
-    func refresh() { guard !busy && !polling else { return }; lastStatusRefresh = Date(); polling = true; client.send(RPCRequest(command:"status",settings:nil,network:nil)) { [weak self] result in guard let self = self else { return }; self.polling = false; let was = self.serviceAvailable; self.accept(result,quiet:true); if self.serviceAvailable && !was && !self.settings.profiles.isEmpty { self.persistAndConfigure() }; if was != self.serviceAvailable { self.buildPage() } } }
+    func refresh() {
+        guard !busy && !polling else { return }
+        lastStatusRefresh = Date(); polling = true
+        client.send(RPCRequest(command:"status",settings:nil,network:nil)) { [weak self] result in
+            guard let self = self else { return }
+            self.polling = false; let was = self.serviceAvailable; self.accept(result,quiet:true)
+            // A launchd restart can happen entirely between two successful polls.
+            // Re-send in-memory profiles even when no IPC failure was observed.
+            let restarted = self.status.serviceInstance.map { $0 != self.configuredServiceInstance } ?? false
+            if self.serviceAvailable && (!was || restarted) && self.settingsReadError == nil && !self.settings.profiles.isEmpty { self.persistAndConfigure() }
+            if was != self.serviceAvailable { self.buildPage() }
+        }
+    }
+    func recordConfiguredInstance(_ result: Result<RPCResponse,Error>) {
+        if case .success(let reply) = result { configuredServiceInstance = reply.status.serviceInstance }
+    }
     func accept(_ result: Result<RPCResponse,Error>, quiet: Bool = false) {
         switch result { case .success(let response):serviceAvailable = true; status = response.status; if !response.ok && !quiet { showError(AppError.message(response.error ?? "Ошибка службы")) }; case .failure(let error):serviceAvailable = false; status.phase = .setup; status.message = FileManager.default.fileExists(atPath:"/Library/LaunchDaemons/ru.hl100.autoturn.helper.plist") ? "Служба недоступна. Её состояние и блокировку сейчас подтвердить нельзя." : "Импортируй AmneziaWG .conf и установи VPN-службу"; if !quiet { showError(error) } }
         updateStatus()
@@ -747,7 +763,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
         do { try saveSettings() } catch { showError(error); return }
         buildPage()
         guard serviceAvailable else { return }; busy = true
-        client.send(RPCRequest(command:"configure",settings:settings,network:observer.snapshot())) { [weak self] result in self?.busy = false; self?.accept(result); self?.observer.report() }
+        client.send(RPCRequest(command:"configure",settings:settings,network:observer.snapshot())) { [weak self] result in self?.recordConfiguredInstance(result); self?.busy = false; self?.accept(result); self?.observer.report() }
     }
     func setMode(_ mode: Mode) {
         if mode == .off && !liveNetworkTest && !confirm("Отключить VPN?",detail:"Вне дома интернет сможет идти напрямую. Автоматика будет выключена до возврата в Авто.") { return }
@@ -763,7 +779,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
         let request = mode == .off ? RPCRequest(command:"stop",settings:nil,network:nil) : RPCRequest(command:"configure",settings:snapshot,network:observer.snapshot())
         client.send(request) { [weak self] result in
             guard let self = self else { return }
-            self.accept(result); self.observer.report()
+            self.recordConfiguredInstance(result); self.accept(result); self.observer.report()
             do { try self.saveSettings() } catch { self.info("Режим применён к службе, но настройки не сохранены: " + error.localizedDescription) }
             self.busy = false
         }
