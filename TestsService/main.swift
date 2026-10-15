@@ -104,3 +104,204 @@ check(Set(matches.keys) == Set([Int32(111),Int32(114)]),"Recovery identified ano
 response = service.handle(RPCRequest(command:"recover",settings:nil,network:nil))
 check(response.ok && response.status.phase == .off,"Repeated emergency recovery failed")
 print("\(passed) checks including emergency recovery and owned-process selection passed")
+
+// Deterministic lease, sleep-sized gaps, cleanup and retry regressions. No waits
+// or real PF/routes/Keychain access; the service clock is supplied by the test.
+final class LeaseRoutes: DomainRouting {
+ var failStop = false, stops = 0
+ func configure(_ settings: RoutingSettings, physical: PhysicalNetwork) throws {}
+ func setTunnel(_ interface: String?, dns: [String], supportsIPv6: Bool) throws {}
+ func recoverJournal() {}
+ func stop() throws { stops += 1; if failStop { throw AppError.message("DNS cleanup failed") } }
+}
+var clock = Date(timeIntervalSince1970:1_800_000_000)
+var leasePhysical = PhysicalNetwork(interface:"en0",gateway:"192.168.1.1",service:"lease-test")
+let leaseGuard = GuardFake(), leaseTunnel = TunnelFake(), leaseRoutes = LeaseRoutes()
+var healthy = true, probes = 0, ownedRecoveryFails = false
+let leaseDirectory = directory.appendingPathComponent("lease")
+try FileManager.default.createDirectory(at:leaseDirectory,withIntermediateDirectories:true)
+let leaseService = Service(Installation(uid:501,cdhashes:[],engine:"unused"),protection:leaseGuard,managedTunnel:leaseTunnel,routing:leaseRoutes,physical:{leasePhysical},health:{_ in probes += 1; return healthy},stateDirectory:leaseDirectory.path,monitoring:false,now:{clock},continuousNow:{clock.timeIntervalSince1970},recoverProcesses:{ if ownedRecoveryFails { throw AppError.message("Owned process still running") } })
+var leaseSettings = settings; leaseSettings.mode = .auto
+func leaseSample(_ ssid:String?, at date:Date? = nil) -> NetworkObservation {
+ NetworkObservation(available:true,interface:leasePhysical.interface,ssid:ssid,gateway:leasePhysical.gateway,sampledAt:date ?? clock)
+}
+func leaseNetwork(_ sample:NetworkObservation) -> RPCResponse { leaseService.handle(RPCRequest(command:"network",settings:nil,network:sample)) }
+_ = leaseService.handle(RPCRequest(command:"configure",settings:leaseSettings,network:leaseSample("home")))
+clock += 3
+check(leaseNetwork(leaseSample(nil)).status.phase == .home && !leaseGuard.active,"One nil SSID immediately blocked home internet")
+clock += 3
+check(leaseNetwork(leaseSample("cafe")).status.phase == .connected,"A known external SSID retained home trust")
+let probesBeforePath = probes
+for _ in 0..<10 { leaseService.physicalNetworkChanged() }
+check(probes == probesBeforePath,"VPN path notifications defeated health-check backoff")
+_ = leaseNetwork(leaseSample("home")); clock += 21
+check(leaseNetwork(leaseSample(nil)).status.phase != .home && leaseGuard.active,"Nil samples extended home trust indefinitely")
+_ = leaseNetwork(leaseSample("home")); clock += 21
+let delayedReply = leaseNetwork(leaseSample("home",at:clock.addingTimeInterval(-21)))
+check(delayedReply.status.phase != .home,"Delayed queued home sample acquired a fresh lease")
+_ = leaseNetwork(leaseSample("home")); clock += 1
+_ = leaseNetwork(leaseSample("cafe"))
+check(leaseNetwork(leaseSample("home",at:clock.addingTimeInterval(-0.5))).status.phase != .home,"Out-of-order home sample replaced newer external sample")
+check(leaseNetwork(leaseSample("home",at:clock.addingTimeInterval(60))).status.phase != .home,"Future timestamp extended home trust")
+_ = leaseNetwork(leaseSample("home")); leasePhysical.gateway = "192.168.2.1"
+leaseService.physicalNetworkChanged()
+check(leaseService.status.phase != .home && leaseGuard.active,"Gateway change retained a cached home SSID")
+_ = leaseNetwork(leaseSample("home")); leasePhysical = PhysicalNetwork()
+leaseService.physicalNetworkChanged()
+check(leaseService.status.phase == .waiting && leaseGuard.active,"Physical disconnect retained direct home access")
+leasePhysical = PhysicalNetwork(interface:"en0",gateway:"192.168.1.1",service:"lease-test")
+_ = leaseNetwork(leaseSample("cafe")); leaseRoutes.failStop = true
+check(leaseNetwork(leaseSample("home")).status.phase == .error,"Routing cleanup failure was hidden")
+let failedStops = leaseRoutes.stops; leaseRoutes.failStop = false; leaseService.tick()
+check(leaseService.status.phase == .home && leaseRoutes.stops == failedStops+1,"Home failed to retry routing cleanup after guard and AWG stopped")
+leaseService.startupRecoveryError = AppError.message("Simulated startup recovery error")
+ownedRecoveryFails = true
+check(leaseService.handle(RPCRequest(command:"stop",settings:nil,network:nil)).status.phase == .error,"Off hid an orphaned process recovery failure")
+ownedRecoveryFails = false
+check(leaseService.handle(RPCRequest(command:"stop",settings:nil,network:nil)).status.phase == .off,"Startup error prevented explicit Off")
+leaseService.startupRecoveryError = nil
+leaseSettings.mode = .on; healthy = false
+_ = leaseService.handle(RPCRequest(command:"configure",settings:leaseSettings,network:leaseSample("cafe")))
+for _ in 0..<2 { _ = leaseService.handle(RPCRequest(command:"check",settings:nil,network:nil)) }
+let startsBeforeRetry = leaseTunnel.starts
+leaseService.tick()
+check(leaseTunnel.starts == startsBeforeRetry,"Single-profile retry skipped its backoff")
+clock += 31; leaseService.tick()
+check(leaseTunnel.starts == startsBeforeRetry+1 && leaseGuard.active,"Single-profile retry never recreated the unresponsive tunnel")
+healthy = true; clock += 11; leaseService.tick()
+check(leaseService.status.phase == .connected,"Single-profile retry did not recover")
+let restoredService = Service(Installation(uid:501,cdhashes:[],engine:"unused"),protection:GuardFake(),managedTunnel:TunnelFake(),routing:LeaseRoutes(),physical:{leasePhysical},health:{_ in true},stateDirectory:leaseDirectory.path,monitoring:false,now:{clock})
+check(restoredService.status.events.contains { $0.contains("повторные проверки") },"Restart discarded the failure history")
+check(restoredService.status.events.count <= 100,"Persistent history grew beyond the diagnostic limit")
+let permissions = try FileManager.default.attributesOfItem(atPath:leaseDirectory.appendingPathComponent("events.json").path)[.posixPermissions] as? NSNumber
+check(permissions?.intValue == 0o600,"Persistent diagnostic events are not private")
+_ = leaseService.handle(RPCRequest(command:"stop",settings:nil,network:nil))
+print("\(passed) checks including home lease expiry, transient nil SSID, delayed samples, cleanup retries, single-profile reconnect and persistent history passed")
+
+// Sleep advances the continuous clock even when the wall clock is corrected.
+var wallClock = Date(timeIntervalSince1970:1_800_000_000), elapsedClock: TimeInterval = 1000
+let wakeGuard = GuardFake(), wakeTunnel = TunnelFake()
+let wakeService = Service(Installation(uid:501,cdhashes:[],engine:"unused"),protection:wakeGuard,managedTunnel:wakeTunnel,routing:LeaseRoutes(),physical:{leasePhysical},health:{_ in true},stateDirectory:directory.path,monitoring:false,now:{wallClock},continuousNow:{elapsedClock})
+var wakeSettings = leaseSettings; wakeSettings.mode = .auto
+func wakeSample(_ ssid:String?, age:TimeInterval = 0) -> NetworkObservation {
+ NetworkObservation(available:true,interface:leasePhysical.interface,ssid:ssid,gateway:leasePhysical.gateway,sampledAt:wallClock.addingTimeInterval(-age),sampledContinuouslyAt:elapsedClock-age)
+}
+_ = wakeService.handle(RPCRequest(command:"configure",settings:wakeSettings,network:wakeSample("home")))
+elapsedClock += 600; wallClock -= 3600; wakeService.tick()
+check(wakeService.status.phase != .home && wakeGuard.active,"Clock rollback after sleep extended old home trust")
+_ = wakeService.handle(RPCRequest(command:"network",settings:nil,network:wakeSample("home")))
+check(wakeService.status.phase == .home && !wakeGuard.active,"Fresh home after clock rollback was rejected")
+elapsedClock += 21 // Wall time stays still, as it can when corrected after sleep.
+wakeService.tick()
+check(wakeService.status.phase != .home && wakeGuard.active,"Lease expiry depended on wall-clock progress")
+_ = wakeService.handle(RPCRequest(command:"network",settings:nil,network:wakeSample("home",age:600)))
+check(wakeService.status.phase != .home,"Pre-sleep sample reacquired home trust")
+_ = wakeService.handle(RPCRequest(command:"network",settings:nil,network:wakeSample("home")))
+elapsedClock += 3; wallClock += 3
+_ = wakeService.handle(RPCRequest(command:"network",settings:nil,network:wakeSample(nil)))
+let deadlineAfterNil = wakeService.nextCheck
+for _ in 0..<20 {
+ _ = wakeService.handle(RPCRequest(command:"network",settings:nil,network:wakeSample("cafe",age:30)))
+}
+check(wakeService.status.phase == .home && wakeService.nextCheck == deadlineAfterNil,"Rejected events changed home policy or retry deadline")
+// Unknown SSID must neither extend home trust nor defeat a retry backoff.
+healthy = false; leaseSettings.mode = .on
+_ = leaseService.handle(RPCRequest(command:"configure",settings:leaseSettings,network:leaseSample("cafe")))
+let scheduledProbe = leaseService.nextCheck, probesAtBackoff = probes
+_ = leaseNetwork(leaseSample(nil))
+_ = leaseNetwork(leaseSample("cafe"))
+_ = leaseNetwork(leaseSample("home",at:clock.addingTimeInterval(-30)))
+check(probes == probesAtBackoff && leaseService.nextCheck == scheduledProbe,"Transient or rejected SSID samples defeated health backoff")
+_ = leaseService.handle(RPCRequest(command:"stop",settings:nil,network:nil))
+_ = wakeService.handle(RPCRequest(command:"stop",settings:nil,network:nil))
+print("\(passed) checks including continuous sleep lease, clock rollback and rejected-observation backoff passed")
+
+// Cross every mode/routing/link state with every other state. These are service
+// transitions with the production decision code, not separate policy replicas.
+let matrixGuard = GuardFake(), matrixTunnel = TunnelFake(), matrixRoutes = LeaseRoutes()
+var matrixPhysical = PhysicalNetwork(interface:"en0",gateway:"192.168.1.1",service:"matrix")
+let matrixService = Service(Installation(uid:501,cdhashes:[],engine:"unused"),protection:matrixGuard,managedTunnel:matrixTunnel,routing:matrixRoutes,physical:{matrixPhysical},health:{_ in true},stateDirectory:directory.path,monitoring:false,now:{clock},continuousNow:{clock.timeIntervalSince1970})
+let modes: [Mode] = [.auto,.on,.off]
+let routingModes: [RoutingMode] = [.all,.rules]
+let links: [String?] = ["home","cafe",nil,"offline"]
+var matrixTransitions = 0
+func applyMatrix(_ mode:Mode,_ route:RoutingMode,_ link:String?) {
+ clock += 1
+ matrixPhysical = link == "offline" ? PhysicalNetwork() : PhysicalNetwork(interface:"en0",gateway:"192.168.1.1",service:"matrix")
+ var candidate = settings; candidate.mode = mode; candidate.routing.mode = route
+ let sample = NetworkObservation(available:matrixPhysical.available,interface:matrixPhysical.interface,ssid:link == "offline" ? nil : link,gateway:matrixPhysical.gateway,sampledAt:clock,sampledContinuouslyAt:clock.timeIntervalSince1970)
+ let reply = matrixService.handle(RPCRequest(command:"configure",settings:candidate,network:sample))
+ check(reply.ok,"Matrix transition returned an unexpected error")
+ if mode == .off || (mode == .auto && link == "home") {
+  check(!matrixGuard.active && !matrixTunnel.running && reply.status.phase == (mode == .off ? .off : .home),"Matrix direct transition left VPN or protection active")
+ } else if link == "offline" {
+  check(matrixGuard.active && reply.status.phase == .waiting,"Matrix disconnected transition lost protection")
+ } else if mode == .on || link == "cafe" {
+  check(matrixGuard.active && matrixTunnel.running && reply.status.phase == .connected,"Matrix VPN transition failed to connect under protection")
+ } else {
+  check((reply.status.phase == .home && !matrixGuard.active && !matrixTunnel.running) || (reply.status.phase == .connected && matrixGuard.active && matrixTunnel.running),"Matrix unknown SSID produced inconsistent status")
+ }
+ matrixTransitions += 1
+}
+for firstMode in modes { for firstRoute in routingModes { for firstLink in links {
+ for secondMode in modes { for secondRoute in routingModes { for secondLink in links {
+  applyMatrix(firstMode,firstRoute,firstLink)
+  applyMatrix(secondMode,secondRoute,secondLink)
+ } } }
+} } }
+_ = matrixService.handle(RPCRequest(command:"stop",settings:nil,network:nil))
+print("\(passed) service checks passed, including \(matrixTransitions) mode/routing/link transitions")
+
+// Model a health probe that stays in flight across Home/Off/profile replacement.
+// The callback is explicitly delivered later, then the production queue drains.
+var asyncCompletions: [(Bool) -> Void] = []
+let asyncGuard = GuardFake(), asyncTunnel = TunnelFake()
+let asyncService = Service(Installation(uid:501,cdhashes:[],engine:"unused"),protection:asyncGuard,managedTunnel:asyncTunnel,routing:LeaseRoutes(),physical:{leasePhysical},asyncHealth:{ _,_,done in asyncCompletions.append(done) },stateDirectory:directory.path,monitoring:false,now:{clock},continuousNow:{clock.timeIntervalSince1970})
+var asyncSettings = settings; asyncSettings.mode = .on
+func asyncConfigure(_ mode:Mode) -> RPCResponse {
+ asyncSettings.mode = mode
+ return asyncService.handle(RPCRequest(command:"configure",settings:asyncSettings,network:leaseSample("home")))
+}
+check(asyncConfigure(.on).status.phase == .connecting && asyncCompletions.count == 1,"Asynchronous health blocked initial configure")
+asyncService.tick(); asyncService.tick()
+check(asyncCompletions.count == 1,"Concurrent duplicate health probes were started")
+check(asyncConfigure(.auto).status.phase == .home && !asyncGuard.active,"Pending health probe delayed a fresh home observation")
+asyncCompletions[0](true); asyncService.queue.sync {}
+check(asyncService.status.phase == .home && !asyncGuard.active,"Late success revived VPN after Home")
+_ = asyncConfigure(.on)
+check(asyncService.handle(RPCRequest(command:"stop",settings:nil,network:nil)).status.phase == .off,"Pending health probe delayed Stop")
+asyncCompletions[1](false); asyncService.queue.sync {}
+check(asyncService.status.phase == .off && !asyncGuard.active,"Late failure changed Off into recovery")
+_ = asyncConfigure(.on)
+let oldCompletion = asyncCompletions.last!
+asyncSettings.selectedID = nil
+_ = asyncConfigure(.on)
+oldCompletion(false); asyncService.queue.sync {}
+check(asyncService.status.phase == .connecting,"An obsolete configuration probe changed the new connection")
+asyncCompletions.last!(true); asyncService.queue.sync {}
+check(asyncService.status.phase == .connected && asyncGuard.active,"Current async success did not verify the protected connection")
+clock += 31; asyncService.tick()
+let pendingCount = asyncCompletions.count
+for _ in 0..<6 { clock += 5; asyncService.tick() }
+check(asyncService.status.phase == .recovering && asyncCompletions.count == pendingCount,"Unanswered async health probe was not timed out")
+asyncCompletions.last!(true); asyncService.queue.sync {}
+check(asyncService.status.phase == .recovering,"Timed-out health callback revived an obsolete connection")
+_ = asyncService.handle(RPCRequest(command:"stop",settings:nil,network:nil))
+print("\(passed) service checks including nonblocking health, stale callbacks and probe timeout passed")
+
+check(service.status.serviceInstance != nil && service.status.serviceInstance != leaseService.status.serviceInstance,"Helper restart identity was not unique")
+let instanceRoundTrip = try JSONDecoder().decode(ServiceStatus.self,from:JSONEncoder().encode(service.status))
+check(instanceRoundTrip.serviceInstance == service.status.serviceInstance,"Helper restart identity did not survive IPC coding")
+print("\(passed) service checks including helper restart identity passed")
+
+_ = wakeService.handle(RPCRequest(command:"configure",settings:wakeSettings,network:wakeSample("home")))
+let wakeStarts = wakeTunnel.starts
+elapsedClock += 60; wallClock += 60; wakeService.tick()
+check(wakeService.status.phase == .waiting && wakeGuard.active && wakeTunnel.starts == wakeStarts,"Wake grace constructed VPN before the app could report fresh home")
+_ = wakeService.handle(RPCRequest(command:"network",settings:nil,network:wakeSample("home")))
+check(wakeService.status.phase == .home && !wakeGuard.active && wakeTunnel.starts == wakeStarts,"Fresh post-wake home did not cancel protected grace immediately")
+elapsedClock += 60; wallClock += 60; wakeService.tick()
+elapsedClock += 4; wallClock += 4; wakeService.tick()
+check(wakeService.status.phase == .connected && wakeGuard.active,"Unknown Wi-Fi after wake grace failed to require VPN")
+_ = wakeService.handle(RPCRequest(command:"stop",settings:nil,network:nil))
+print("\(passed) service checks including protected wake grace and unknown-network fallback passed")

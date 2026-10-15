@@ -16,11 +16,11 @@ enum OwnedProcessRecovery {
     static func stop() throws {
         let owned = try current()
         for (pid,command) in owned where try current()[pid] == command { kill(pid,SIGTERM) }
-        let deadline = Date().addingTimeInterval(2)
-        while Date() < deadline { if try current().isEmpty { return }; Thread.sleep(forTimeInterval:0.05) }
+        let deadline = ContinuousTime.now() + 2
+        while ContinuousTime.now() < deadline { if try current().isEmpty { return }; Thread.sleep(forTimeInterval:0.05) }
         for (pid,command) in owned where try current()[pid] == command { kill(pid,SIGKILL) }
-        let end = Date().addingTimeInterval(2)
-        while Date() < end { if try current().isEmpty { return }; Thread.sleep(forTimeInterval:0.05) }
+        let end = ContinuousTime.now() + 2
+        while ContinuousTime.now() < end { if try current().isEmpty { return }; Thread.sleep(forTimeInterval:0.05) }
         guard try current().isEmpty else { throw AppError.message("Не удалось остановить оставшиеся процессы AutoTurn") }
     }
 }
@@ -34,7 +34,7 @@ enum EmergencyNetworkRecovery {
         let guardManager = TrafficGuard()
         if let data = try? Data(contentsOf:URL(fileURLWithPath:support + "/guard.json")), let saved = try? JSONDecoder().decode(SavedGuard.self,from:data) { guardManager.restoreToken(saved.token) }
         try guardManager.remove()
-        RoutingCoreManager(protection:guardManager).recoverJournal(); Tunnel().recoverJournal()
+        try RoutingCoreManager(protection:guardManager).recoverJournal(); try Tunnel().recoverJournal()
         try JSONEncoder().encode(SavedGuard(required:false,token:nil)).write(to:URL(fileURLWithPath:support + "/guard.json"),options:.atomic)
         chmod(support + "/guard.json",0o600)
         guard if_nametoindex("utun99") == 0 else { throw AppError.message("Интерфейс маршрутов ещё занят; восстановление не подтверждено") }

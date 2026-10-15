@@ -1,5 +1,6 @@
 #!/bin/bash
 set -euo pipefail
+export GOTOOLCHAIN=${GOTOOLCHAIN:-go1.26.9}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BUILD="$ROOT/.build"
 DIST=${AT_DIST:-"$ROOT/dist"}
@@ -58,7 +59,8 @@ printf '%s\n' 'v3.1.20260828 b5928efb6ca19f0153958460c3d141f04abc5c2e' > "$APP/C
 [ -x "$ROOT/third_party/routing-core/sing-box" ] || { echo "Run scripts/prepare-routing-core.sh first"; exit 1; }
 cp "$ROOT/third_party/routing-core/sing-box" "$APP/Contents/Resources/routing-core"
 cp "$ROOT/third_party/routing-core/LICENSE" "$APP/Contents/Resources/RoutingCore-LICENSE.txt"
-printf '%s\n' 'sing-box v1.14.3 7054cac5124465ffdb145870d7c01885566711b1; AutoTurn patches; CGO_ENABLED=0; Go 1.26.9' > "$APP/Contents/Resources/routing-core-provenance.txt"
+printf '%s\n' 'sing-box v1.14.3 7054cac5124465ffdb145870d7c01885566711b1; AutoTurn patches; CGO_ENABLED=0' > "$APP/Contents/Resources/routing-core-provenance.txt"
+"$ROOT/third_party/routing-core/sing-box" version >> "$APP/Contents/Resources/routing-core-provenance.txt"
 /usr/bin/codesign --force --sign - --identifier ru.hl100.autoturn.routing "$APP/Contents/Resources/routing-core"
 cp "$ROOT/THIRD-PARTY.md" "$APP/Contents/Resources/THIRD-PARTY.md"
 chmod +x "$APP/Contents/Resources/install-service.sh"

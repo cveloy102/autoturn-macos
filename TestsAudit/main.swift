@@ -128,5 +128,34 @@ if let path = ProcessInfo.processInfo.environment["AT_TEST_ROUTING_CORE"] {
     }
 }
 
+// These run actual native subprocesses; no root, DNS or route mutations.
+check((try? SystemCommand.run("/usr/bin/printf",["hello"]))?.output == "hello","System command captures normal output")
+check((try? SystemCommand.run("/bin/sh",["-c","exit 7"]))?.code == 7,"System command preserves failure exit status")
+let inputText = String(repeating:"bounded input\n",count:5000)
+check((try? SystemCommand.run("/bin/cat",[],input:inputText))?.output == inputText,"System command simultaneously drains output and writes pipe-sized input")
+let commandStarted = ContinuousTime.now()
+check(rejects { _ = try SystemCommand.run("/bin/sleep",["10"],timeout:0.15) },"Hung subprocess is terminated at deadline")
+check(ContinuousTime.now() - commandStarted < 2,"Hung subprocess does not delay recovery indefinitely")
+check(rejects { _ = try SystemCommand.run("/usr/bin/yes",[],timeout:2,outputLimit:1024) },"Unbounded subprocess output is rejected")
+check(rejects { _ = try SystemCommand.run("/bin/sh",["-c","exec 1>&- 2>&-; sleep 10"],timeout:0.15) },"Closed output does not hide a hung subprocess")
+check((try? SystemCommand.run("/bin/cat",[],input:""))?.output == "","Empty stdin is closed without hanging")
+check(rejects { _ = try SystemCommand.run("/missing-autoturn-command",[]) },"Missing executable reports a launch error")
+let journalPath = directory.appendingPathComponent("recovery-journal.json").path
+let savedJournal = Tunnel.Journal(endpoint:"198.51.100.10",gateway:"192.168.1.1",dnsKey:"State:/Network/Service/AutoTurn-test/DNS")
+try JSONEncoder().encode(savedJournal).write(to:URL(fileURLWithPath:journalPath))
+var failDNSRemoval = true, routeCode: Int32 = 1, routeOutput = "route: permission denied", routeDeletes = 0
+let recoveryTunnel = Tunnel(journal:journalPath,command:{ _,_ in routeDeletes += 1; return CommandResult(code:routeCode,output:routeOutput) },removeDNS:{ _ in if failDNSRemoval { throw AppError.message("simulated DNS failure") } })
+check(rejects { try recoveryTunnel.recoverJournal() } && FileManager.default.fileExists(atPath:journalPath),"Failed DNS recovery retains journal and reports failure")
+failDNSRemoval = false
+check(rejects { try recoveryTunnel.stop() } && FileManager.default.fileExists(atPath:journalPath),"Nonzero route deletion exit preserves recovery journal")
+routeCode = 0
+check(!rejects { try recoveryTunnel.stop() } && !FileManager.default.fileExists(atPath:journalPath),"Repeated Stop completes saved route and DNS cleanup")
+try JSONEncoder().encode(savedJournal).write(to:URL(fileURLWithPath:journalPath))
+routeCode = 1; routeOutput = "route: writing to routing socket: not in table"
+check(!rejects { try recoveryTunnel.stop() } && !FileManager.default.fileExists(atPath:journalPath),"Already removed route is an idempotent cleanup success")
+try JSONEncoder().encode(Tunnel.Journal(endpoint:"invalid",gateway:"192.168.1.1",dnsKey:nil)).write(to:URL(fileURLWithPath:journalPath))
+let deletesBeforeInvalid = routeDeletes
+check(rejects { try recoveryTunnel.stop() } && routeDeletes == deletesBeforeInvalid,"Malformed journal cannot execute a route mutation")
+
 print("Audit: \(checks) checks, \(failures) failures. No system network or Keychain changes.")
 exit(failures == 0 ? 0 : 1)

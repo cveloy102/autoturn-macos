@@ -1,6 +1,17 @@
 import Foundation
 import Darwin
 
+// Unlike wall time or systemUptime, this clock includes time spent asleep and
+// cannot move backwards when macOS synchronizes its date after waking.
+enum ContinuousTime {
+    private static let scale: Double = {
+        var info = mach_timebase_info_data_t()
+        mach_timebase_info(&info)
+        return Double(info.numer) / Double(info.denom) / 1_000_000_000
+    }()
+    static func now() -> TimeInterval { Double(mach_continuous_time()) * scale }
+}
+
 enum AppError: Error, LocalizedError {
     case message(String)
     var errorDescription: String? { if case .message(let text) = self { return text }; return nil }
@@ -153,9 +164,19 @@ struct Settings: Codable {
         routing = try c.decodeIfPresent(RoutingSettings.self,forKey:.routing) ?? RoutingSettings()
     }
 }
-struct NetworkObservation: Codable { var available: Bool; var interface: String?; var ssid: String?; var gateway: String? }
+struct NetworkObservation: Codable {
+    var available: Bool
+    var interface: String?
+    var ssid: String?
+    var gateway: String?
+    // Optional for compatibility with older installed apps. Never renew a lease
+    // merely because an old observation finally reached the helper queue.
+    var sampledAt: Date? = nil
+    var sampledContinuouslyAt: TimeInterval? = nil
+}
 struct ServiceStatus: Codable {
     var routingProtocol: Int? = 2
+    var serviceInstance: String? = nil
     var phase: Phase = .setup
     var mode: Mode = .auto
     var profileID: String?
@@ -165,6 +186,7 @@ struct ServiceStatus: Codable {
     var guardActive: Bool = false
     var verifiedAt: Date?
     var events: [String] = []
+    var eventLogError: String?
     var tunnel: String?
 }
 struct RPCRequest: Codable { var command: String; var settings: Settings?; var network: NetworkObservation? }

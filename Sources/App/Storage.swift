@@ -45,7 +45,30 @@ enum Storage {
 
 final class ServiceClient {
     let queue = DispatchQueue(label: "ru.hl100.autoturn.client")
+    private let transport: (RPCRequest) throws -> RPCResponse
+    init(transport: @escaping (RPCRequest) throws -> RPCResponse = IPC.request) { self.transport = transport }
+    // Main-thread mailbox: a slow request may retain only the newest network
+    // sample. User commands run before that sample, never behind a timer backlog.
+    private var pendingNetwork: (RPCRequest, (Result<RPCResponse, Error>) -> Void)?
+    private var networkInFlight = false
     func send(_ request: RPCRequest, completion: @escaping (Result<RPCResponse, Error>) -> Void) {
-        queue.async { let result = Result { try IPC.request(request) }; DispatchQueue.main.async { completion(result) } }
+        if request.command == "network" {
+            pendingNetwork = (request, completion)
+            sendLatestNetwork()
+            return
+        }
+        queue.async { let result = Result { try self.transport(request) }; DispatchQueue.main.async { completion(result) } }
+    }
+    private func sendLatestNetwork() {
+        guard !networkInFlight, let (request, completion) = pendingNetwork else { return }
+        pendingNetwork = nil; networkInFlight = true
+        queue.async {
+            let result = Result { try self.transport(request) }
+            DispatchQueue.main.async {
+                self.networkInFlight = false
+                completion(result)
+                self.sendLatestNetwork()
+            }
+        }
     }
 }

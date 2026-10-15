@@ -20,7 +20,7 @@ extension TrafficProtection {
 protocol ManagedTunnel: AnyObject {
     var running: Bool { get }
     var interface: String? { get }
-    func recoverJournal()
+    func recoverJournal() throws
     func start(_ profile: Profile, physical: PhysicalNetwork, engine: String) throws
     func stop() throws
     func setRoutingMode(_ mode: RoutingMode)
@@ -29,11 +29,57 @@ extension ManagedTunnel { func setRoutingMode(_ mode: RoutingMode) {} }
 
 struct CommandResult { var code: Int32; var output: String }
 enum SystemCommand {
-    static func run(_ executable: String, _ arguments: [String], input: String? = nil) throws -> CommandResult {
+    static func run(_ executable: String, _ arguments: [String], input: String? = nil, timeout: TimeInterval = 15, outputLimit: Int = 1024 * 1024) throws -> CommandResult {
+        guard timeout.isFinite, timeout > 0, outputLimit > 0 else { throw AppError.message("Некорректные ограничения системной операции") }
         let process = Process(); process.executableURL = URL(fileURLWithPath: executable); process.arguments = arguments
-        let output = Pipe(); process.standardOutput = output; process.standardError = output
-        if let input = input { let pipe = Pipe(); process.standardInput = pipe; try process.run(); pipe.fileHandleForWriting.write(Data(input.utf8)); pipe.fileHandleForWriting.closeFile() } else { try process.run() }
-        let data = output.fileHandleForReading.readDataToEndOfFile(); process.waitUntilExit()
+        let output = Pipe(), source = input.map { Data($0.utf8) }
+        guard (source?.count ?? 0) <= 1024 * 1024 else { throw AppError.message("Слишком большой ввод системной операции") }
+        process.standardOutput = output; process.standardError = output
+        let inputPipe = source == nil ? nil : Pipe()
+        process.standardInput = inputPipe.map { $0 as Any } ?? FileHandle.nullDevice
+        let readFD = output.fileHandleForReading.fileDescriptor
+        let writeFD = inputPipe?.fileHandleForWriting.fileDescriptor
+        _ = fcntl(readFD, F_SETFL, fcntl(readFD, F_GETFL) | O_NONBLOCK)
+        if let fd = writeFD { _ = fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK); _ = fcntl(fd, F_SETNOSIGPIPE, 1) }
+        defer { try? output.fileHandleForReading.close(); try? inputPipe?.fileHandleForWriting.close() }
+        try process.run()
+        // Close parent copies of the child's pipe ends so EOF remains observable.
+        try? output.fileHandleForWriting.close(); try? inputPipe?.fileHandleForReading.close()
+        let deadline = ContinuousTime.now() + timeout
+        var data = Data(), buffer = [UInt8](repeating:0,count:16384), offset = 0, eof = false, inputClosed = false
+        do {
+            while !eof || process.isRunning {
+                // Bound the drain loop too: an endless writer must not starve the deadline.
+                for _ in 0..<16 where !eof {
+                    let count = Darwin.read(readFD,&buffer,buffer.count)
+                    if count > 0 {
+                        guard count <= outputLimit - data.count else { throw AppError.message("Слишком большой вывод системной операции") }
+                        data.append(contentsOf:buffer.prefix(count))
+                    } else if count == 0 { eof = true }
+                    else if errno == EINTR { continue }
+                    else if errno == EAGAIN { break }
+                    else { throw AppError.message("Не удалось прочитать ответ системной операции") }
+                }
+                if let source = source, let fd = writeFD, !inputClosed {
+                    if offset < source.count {
+                        let count = source.withUnsafeBytes { Darwin.write(fd,$0.baseAddress!.advanced(by:offset),min(16384,source.count-offset)) }
+                        if count > 0 { offset += count }
+                        else if count < 0 && errno != EAGAIN && errno != EINTR { throw AppError.message("Не удалось передать ввод системной операции") }
+                    }
+                    if offset == source.count { try inputPipe?.fileHandleForWriting.close(); inputClosed = true }
+                }
+                if eof && !process.isRunning { break }
+                guard ContinuousTime.now() < deadline else { throw AppError.message("Системная операция \(URL(fileURLWithPath:executable).lastPathComponent) превысила время ожидания") }
+                Thread.sleep(forTimeInterval:0.01)
+            }
+        } catch {
+            // Do not wait for a subprocess or inherited pipe indefinitely.
+            if process.isRunning { kill(process.processIdentifier,SIGKILL) }
+            let end = ContinuousTime.now() + 1
+            while process.isRunning && ContinuousTime.now() < end { Thread.sleep(forTimeInterval:0.01) }
+            throw error
+        }
+        process.waitUntilExit()
         return CommandResult(code: process.terminationStatus, output: String(data: data, encoding: .utf8) ?? "")
     }
     static func checked(_ executable: String, _ args: [String], input: String? = nil) throws -> String {
@@ -123,15 +169,39 @@ final class Tunnel: ManagedTunnel {
     private var dnsService: String?
     var routingMode: RoutingMode = .all
     func setRoutingMode(_ mode: RoutingMode) { routingMode = mode }
+    private var rulesIPv6 = false
     private var splitRoutes: [(Bool, String)] = []
-    private let journal = "/Library/Application Support/AutoTurn/network-journal.json"
+    private let journal: String
+    private let command: (String, [String]) throws -> CommandResult
+    private let removeDNS: (String) throws -> Void
+    init(journal: String = "/Library/Application Support/AutoTurn/network-journal.json", command: @escaping (String, [String]) throws -> CommandResult = { try SystemCommand.run($0,$1) }, removeDNS: @escaping (String) throws -> Void = Tunnel.removeDNSKey) {
+        self.journal = journal; self.command = command; self.removeDNS = removeDNS
+    }
+    static func removeDNSKey(_ key: String) throws {
+        guard let store = SCDynamicStoreCreate(nil,"AutoTurnDNS" as CFString,nil,nil) else { throw AppError.message("DNS недоступен для очистки") }
+        if SCDynamicStoreCopyValue(store,key as CFString) != nil && !SCDynamicStoreRemoveValue(store,key as CFString) { throw AppError.message("Не удалось убрать DNS AutoTurn") }
+    }
+    private func deleteRoute(_ args: [String]) throws {
+        let result = try command("/sbin/route",["-n","delete"] + args)
+        // The kernel removes interface routes when a utun disappears. Repeating
+        // that successful cleanup must work; other failures retain the journal.
+        guard result.code == 0 || result.output.contains("not in table") || result.output.contains("No such process") else { throw AppError.message("Не удалось удалить маршрут AutoTurn") }
+    }
     struct Journal: Codable { var endpoint: String?; var gateway: String?; var dnsKey: String? }
     private func saveJournal() { if let data = try? JSONEncoder().encode(Journal(endpoint:endpointRoute?.0,gateway:endpointRoute?.1,dnsKey:dnsService)) { try? data.write(to:URL(fileURLWithPath:journal),options:.atomic); chmod(journal,0o600) } }
-    func recoverJournal() {
-        guard let data = try? Data(contentsOf:URL(fileURLWithPath:journal)), let saved = try? JSONDecoder().decode(Journal.self,from:data) else { return }
-        if let key = saved.dnsKey, key.range(of:"^State:/Network/Service/AutoTurn-[A-Za-z0-9-]+/DNS$",options:.regularExpression) != nil, let store = SCDynamicStoreCreate(nil,"AutoTurnDNS" as CFString,nil,nil) { SCDynamicStoreRemoveValue(store,key as CFString) }
-        if let endpoint = saved.endpoint, let gateway = saved.gateway, Profile.isIP(endpoint), Profile.isIP(gateway) { _ = try? SystemCommand.run("/sbin/route",["-n","delete","-host",endpoint,gateway]) }
-        try? FileManager.default.removeItem(atPath:journal)
+    func recoverJournal() throws { try recoverSavedJournal() }
+    private func recoverSavedJournal() throws {
+        guard FileManager.default.fileExists(atPath:journal) else { return }
+        let saved = try JSONDecoder().decode(Journal.self,from:Data(contentsOf:URL(fileURLWithPath:journal)))
+        if let key = saved.dnsKey {
+            guard key.range(of:"^State:/Network/Service/AutoTurn-[A-Za-z0-9-]+/DNS$",options:.regularExpression) != nil else { throw AppError.message("Некорректный журнал DNS AutoTurn") }
+            try removeDNS(key)
+        }
+        if let endpoint = saved.endpoint, let gateway = saved.gateway {
+            guard Profile.isIP(endpoint), Profile.isIP(gateway) else { throw AppError.message("Некорректный журнал маршрутов AutoTurn") }
+            try deleteRoute(["-host",endpoint,gateway])
+        }
+        try FileManager.default.removeItem(atPath:journal)
     }
     var running: Bool { process?.isRunning == true }
     func start(_ profile: Profile, physical: PhysicalNetwork, engine: String) throws {
@@ -163,7 +233,7 @@ final class Tunnel: ManagedTunnel {
         _ = try SystemCommand.checked("/sbin/ifconfig", [iface, "mtu", String(profile.mtu), "up"])
         if routingMode == .rules {
             _ = try SystemCommand.checked("/sbin/route",["-n","add","-ifscope",iface,"default","-interface",iface])
-            if profile.hasIPv6 { _ = try SystemCommand.checked("/sbin/route",["-n","add","-inet6","-ifscope",iface,"default","-interface",iface]) }
+            if profile.hasIPv6 { _ = try SystemCommand.checked("/sbin/route",["-n","add","-inet6","-ifscope",iface,"default","-interface",iface]); rulesIPv6 = true }
         } else {
         for route in ["0.0.0.0/1", "128.0.0.0/1"] { _ = try SystemCommand.checked("/sbin/route", ["-n", "add", "-net", route, "-interface", iface]); splitRoutes.append((false, route)) }
         if profile.hasIPv6 { for route in ["::/1", "8000::/1"] { _ = try SystemCommand.checked("/sbin/route", ["-n", "add", "-inet6", route, "-interface", iface]); splitRoutes.append((true, route)) } }
@@ -179,32 +249,47 @@ final class Tunnel: ManagedTunnel {
     }
     func stop() throws {
         var errors: [String] = []
-        if let key = dnsService, let store = SCDynamicStoreCreate(nil, "AutoTurnDNS" as CFString, nil, nil) {
-            if SCDynamicStoreCopyValue(store,key as CFString) != nil && !SCDynamicStoreRemoveValue(store, key as CFString) { errors.append("Не удалось убрать DNS AutoTurn") }
-            else { dnsService = nil }
+        // Also retry a journal left by a previous helper process. Do this before
+        // touching live metadata, which is journaled again if anything fails.
+        if process == nil && interface == nil && endpointRoute == nil && dnsService == nil {
+            try recoverSavedJournal()
+        }
+        if let key = dnsService {
+            do { try removeDNS(key); dnsService = nil } catch { errors.append(error.localizedDescription) }
         }
         if routingMode == .rules, let iface = interface {
-            _ = try? SystemCommand.run("/sbin/route",["-n","delete","-ifscope",iface,"default","-interface",iface])
-            _ = try? SystemCommand.run("/sbin/route",["-n","delete","-inet6","-ifscope",iface,"default","-interface",iface])
+            do { try deleteRoute(["-ifscope",iface,"default","-interface",iface]) } catch { errors.append(error.localizedDescription) }
+            // Only an IPv6 default actually installed by us needs removal.
+            if rulesIPv6 {
+                do { try deleteRoute(["-inet6","-ifscope",iface,"default","-interface",iface]) } catch { errors.append(error.localizedDescription) }
+            }
         }
+        var remaining: [(Bool,String)] = []
         for (v6, route) in splitRoutes.reversed() {
-            let result = try? SystemCommand.run("/sbin/route", ["-n", "delete"] + (v6 ? ["-inet6"] : []) + ["-net", route, "-interface", interface ?? ""])
-            if result == nil { errors.append("Не удалось удалить маршрут AutoTurn") }
+            do { try deleteRoute((v6 ? ["-inet6"] : []) + ["-net",route,"-interface",interface ?? ""]) }
+            catch { remaining.append((v6,route)); errors.append(error.localizedDescription) }
         }
-        splitRoutes = []
+        splitRoutes = remaining.reversed()
         if let process = process, process.isRunning {
             process.terminate()
-            let deadline = Date().addingTimeInterval(2)
-            while process.isRunning && Date() < deadline { Thread.sleep(forTimeInterval:0.025) }
+            let deadline = ContinuousTime.now() + 2
+            while process.isRunning && ContinuousTime.now() < deadline { Thread.sleep(forTimeInterval:0.025) }
             if process.isRunning { kill(process.processIdentifier,SIGKILL) }
-            let killDeadline = Date().addingTimeInterval(2)
-            while process.isRunning && Date() < killDeadline { Thread.sleep(forTimeInterval:0.025) }
+            let killDeadline = ContinuousTime.now() + 2
+            while process.isRunning && ContinuousTime.now() < killDeadline { Thread.sleep(forTimeInterval:0.025) }
             if process.isRunning { errors.append("Движок VPN не остановился") }
         }
-        process = nil; interface = nil
-        if let (ip, gateway) = endpointRoute { _ = try? SystemCommand.run("/sbin/route", ["-n", "delete", "-host", ip, gateway]) }; endpointRoute = nil
-        if errors.isEmpty { try? FileManager.default.removeItem(atPath:journal) }
-        else { throw AppError.message(errors.joined(separator:". ")) }
+        if process?.isRunning != true { process = nil }
+        if let (ip,gateway) = endpointRoute {
+            do { try deleteRoute(["-host",ip,gateway]); endpointRoute = nil } catch { errors.append(error.localizedDescription) }
+        }
+        if errors.isEmpty {
+            interface = nil; rulesIPv6 = false
+            if FileManager.default.fileExists(atPath:journal) { try FileManager.default.removeItem(atPath:journal) }
+        } else {
+            if endpointRoute != nil || dnsService != nil { saveJournal() }
+            throw AppError.message(errors.joined(separator:". "))
+        }
     }
     private func netmask(_ prefix: Int) -> String { let bits: UInt32 = prefix == 0 ? 0 : UInt32.max << (32-prefix); return [24,16,8,0].map { String((bits >> $0) & 255) }.joined(separator: ".") }
 }

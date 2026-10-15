@@ -17,10 +17,13 @@ rsync -a --exclude=.git "$ROOT/.build/amneziawg-go/" "$COPY/amneziawg-go/"
 cp "$ROOT/scripts/prepare-routing-core.sh" "$ROOT/scripts/build.sh" "$COPY/"
 cp "$ROOT/DEVELOPMENT.md" "$COPY/BUILD.md"
 tar -czf "$OUT/AutoTurn-$VERSION-third-party-source.tar.gz" -C "$ROOT/.build" corresponding-source
-python3 - "$OUT" <<'PY'
+python3 - "$OUT" "$VERSION" <<'PY'
 import hashlib,json,os,subprocess,sys
 from pathlib import Path
 out=Path(sys.argv[1])
-manifest={'commit':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),'runID':os.environ.get('GITHUB_RUN_ID'),'sha256':{p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in out.glob('*') if p.is_file()}}
+version=sys.argv[2]
+# Repackaging must not hash the previous manifest or attribute old versions to
+# the current source commit.
+manifest={'commit':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),'version':version,'runID':os.environ.get('GITHUB_RUN_ID'),'sha256':{p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(out.glob(f'AutoTurn-{version}-*')) if p.is_file()}}
 (out/'candidate.json').write_text(json.dumps(manifest,indent=2)+'\n')
 PY
