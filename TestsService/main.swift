@@ -117,10 +117,10 @@ final class LeaseRoutes: DomainRouting {
 var clock = Date(timeIntervalSince1970:1_800_000_000)
 var leasePhysical = PhysicalNetwork(interface:"en0",gateway:"192.168.1.1",service:"lease-test")
 let leaseGuard = GuardFake(), leaseTunnel = TunnelFake(), leaseRoutes = LeaseRoutes()
-var healthy = true, probes = 0
+var healthy = true, probes = 0, ownedRecoveryFails = false
 let leaseDirectory = directory.appendingPathComponent("lease")
 try FileManager.default.createDirectory(at:leaseDirectory,withIntermediateDirectories:true)
-let leaseService = Service(Installation(uid:501,cdhashes:[],engine:"unused"),protection:leaseGuard,managedTunnel:leaseTunnel,routing:leaseRoutes,physical:{leasePhysical},health:{_ in probes += 1; return healthy},stateDirectory:leaseDirectory.path,monitoring:false,now:{clock})
+let leaseService = Service(Installation(uid:501,cdhashes:[],engine:"unused"),protection:leaseGuard,managedTunnel:leaseTunnel,routing:leaseRoutes,physical:{leasePhysical},health:{_ in probes += 1; return healthy},stateDirectory:leaseDirectory.path,monitoring:false,now:{clock},recoverProcesses:{ if ownedRecoveryFails { throw AppError.message("Owned process still running") } })
 var leaseSettings = settings; leaseSettings.mode = .auto
 func leaseSample(_ ssid:String?, at date:Date? = nil) -> NetworkObservation {
  NetworkObservation(available:true,interface:leasePhysical.interface,ssid:ssid,gateway:leasePhysical.gateway,sampledAt:date ?? clock)
@@ -154,6 +154,9 @@ check(leaseNetwork(leaseSample("home")).status.phase == .error,"Routing cleanup 
 let failedStops = leaseRoutes.stops; leaseRoutes.failStop = false; leaseService.tick()
 check(leaseService.status.phase == .home && leaseRoutes.stops == failedStops+1,"Home failed to retry routing cleanup after guard and AWG stopped")
 leaseService.startupRecoveryError = AppError.message("Simulated startup recovery error")
+ownedRecoveryFails = true
+check(leaseService.handle(RPCRequest(command:"stop",settings:nil,network:nil)).status.phase == .error,"Off hid an orphaned process recovery failure")
+ownedRecoveryFails = false
 check(leaseService.handle(RPCRequest(command:"stop",settings:nil,network:nil)).status.phase == .off,"Startup error prevented explicit Off")
 leaseService.startupRecoveryError = nil
 leaseSettings.mode = .on; healthy = false

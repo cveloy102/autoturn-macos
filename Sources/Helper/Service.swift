@@ -13,6 +13,7 @@ final class Service {
     let domainRoutes: DomainRouting
     let physicalRead: () -> PhysicalNetwork
     let healthCheck: ((String) -> Bool)?
+    let recoverProcesses: () throws -> Void
     let stateDirectory: String
     var settings = Settings(), status = ServiceStatus()
     var observation = NetworkObservation(available: false, interface: nil, ssid: nil, gateway: nil)
@@ -31,8 +32,9 @@ final class Service {
     let installation: Installation
     let timer: DispatchSourceTimer
     let monitor = NWPathMonitor()
-    init(_ installation: Installation, protection: TrafficProtection = TrafficGuard(), managedTunnel: ManagedTunnel = Tunnel(), routing: DomainRouting? = nil, physical: @escaping () -> PhysicalNetwork = PhysicalNetwork.read, health: ((String) -> Bool)? = nil, stateDirectory: String = support, monitoring: Bool = true, now: @escaping () -> Date = Date.init) {
+    init(_ installation: Installation, protection: TrafficProtection = TrafficGuard(), managedTunnel: ManagedTunnel = Tunnel(), routing: DomainRouting? = nil, physical: @escaping () -> PhysicalNetwork = PhysicalNetwork.read, health: ((String) -> Bool)? = nil, stateDirectory: String = support, monitoring: Bool = true, now: @escaping () -> Date = Date.init, recoverProcesses: @escaping () throws -> Void = OwnedProcessRecovery.stop) {
         self.now = now
+        self.recoverProcesses = recoverProcesses
         self.installation = installation; domainRoutes = routing ?? RoutingCoreManager(protection:protection,directory:stateDirectory); guardManager = protection; tunnel = managedTunnel; physicalRead = physical; healthCheck = health; self.stateDirectory = stateDirectory
         let historyURL = URL(fileURLWithPath:stateDirectory + "/events.json")
         if let size = try? historyURL.resourceValues(forKeys:[.fileSizeKey]).fileSize, size <= 128 * 1024,
@@ -46,7 +48,7 @@ final class Service {
         }
         if guardRequired { do { try guardManager.apply(tunnel:nil,profile:nil); saveGuard() } catch { status.phase = .error; status.message = "Не удалось восстановить блокировку после перезапуска" } }
         if monitoring && stateDirectory == support {
-            do { try OwnedProcessRecovery.stop() } catch { startupRecoveryError = error; status.phase = .error; status.message = error.localizedDescription }
+            do { try recoverProcesses() } catch { startupRecoveryError = error; status.phase = .error; status.message = error.localizedDescription }
         }
         domainRoutes.recoverJournal(); tunnel.recoverJournal()
         timer.schedule(deadline: monitoring ? .now() : .now() + 3600, repeating: monitoring ? 5 : 3600)
@@ -83,7 +85,7 @@ final class Service {
         status.events.append("\(timestamp)  \(text)"); status.events = Array(status.events.suffix(100))
         let path = stateDirectory + "/events.json"
         if let data = try? JSONEncoder().encode(status.events) {
-            do { try data.write(to:URL(fileURLWithPath:path),options:.atomic); chmod(path,0o600) }
+            do { try data.write(to:URL(fileURLWithPath:path),options:.atomic); chmod(path,0o600); status.eventLogError = nil }
             catch { status.eventLogError = "Не удалось сохранить журнал событий" }
         }
     }
@@ -121,7 +123,7 @@ final class Service {
                 do { try guardManager.remove() } catch { errors.append(error.localizedDescription) }
                 do { try domainRoutes.stop() } catch { errors.append(error.localizedDescription) }
                 do { try tunnel.stop() } catch { errors.append(error.localizedDescription) }
-                if stateDirectory == support { do { try OwnedProcessRecovery.stop() } catch { errors.append(error.localizedDescription) } }
+                if stateDirectory == support { do { try recoverProcesses() } catch { errors.append(error.localizedDescription) } }
                 domainRoutes.recoverJournal(); tunnel.recoverJournal()
                 guardRequired = guardManager.active; saveGuard()
                 cleanupPending = !errors.isEmpty
@@ -170,12 +172,16 @@ final class Service {
             if !wanted {
                 pendingTunnelReset = false; retryTunnelAfterBackoff = false
                 var cleanupError: Error?
-                if cleanupPending || tunnel.running || tunnel.interface != nil || guardManager.active || guardRequired || guardManager.token != nil {
+                if cleanupPending || startupRecoveryError != nil || tunnel.running || tunnel.interface != nil || guardManager.active || guardRequired || guardManager.token != nil {
                     // Once direct Internet is requested, release PF before stopping
                     // the engine so a slow process exit cannot leave the user blocked.
                     do { try guardManager.remove() } catch { cleanupError = error }
                     do { try domainRoutes.stop() } catch { if cleanupError == nil { cleanupError = error } }
                     do { try tunnel.stop() } catch { if cleanupError == nil { cleanupError = error } }
+                    if startupRecoveryError != nil {
+                        do { try recoverProcesses(); startupRecoveryError = nil }
+                        catch { if cleanupError == nil { cleanupError = error } }
+                    }
                     guardRequired = guardManager.active; saveGuard(); event("Наш VPN отключён")
                 }
                 cleanupPending = cleanupError != nil
