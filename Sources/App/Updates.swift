@@ -86,15 +86,22 @@ final class Updater {
               bundle.object(forInfoDictionaryKey:"CFBundleShortVersionString") as? String == release.version,
               bundle.object(forInfoDictionaryKey:"CFBundleVersion") as? String == String(release.build),
               bundle.url(forResource:"install-service",withExtension:"sh") != nil else { throw AppError.message("В пакете другая версия приложения") }
-        func verify(_ executable:String,_ arguments:[String]) throws {
-            let process = Process(); process.executableURL = URL(fileURLWithPath:executable); process.arguments = arguments
+        func verify(_ arguments:[String],failure:String) throws {
+            let process = Process(); process.executableURL = URL(fileURLWithPath:"/usr/bin/codesign"); process.arguments = arguments
             process.standardOutput = FileHandle.nullDevice; process.standardError = FileHandle.nullDevice
             try process.run(); process.waitUntilExit()
-            guard process.terminationStatus == 0 else { throw AppError.message("Пакет не прошёл проверку подписи или совместимости Intel/Apple Silicon") }
+            guard process.terminationStatus == 0 else { throw AppError.message(failure) }
         }
-        try verify("/usr/bin/codesign",["--verify","--deep","--strict",app.path])
+        try verify(["--verify","--deep","--strict",app.path],failure:"Не прошла проверка подписи пакета AutoTurn. Скачайте пакет заново.")
         for component in ["Contents/MacOS/AutoTurn","Contents/Library/LaunchServices/AutoTurnHelper","Contents/Resources/amneziawg-go","Contents/Resources/routing-core"] {
-            try verify("/usr/bin/lipo",[app.appendingPathComponent(component).path,"-verify_arch","x86_64","arm64"])
+            let path = app.appendingPathComponent(component).path
+            let name = app.appendingPathComponent(component).lastPathComponent
+            // lipo is a developer-tools shim on macOS. End-user validation must
+            // work without Xcode/Command Line Tools; codesign is part of macOS.
+            try verify(["--verify","--strict","--all-architectures",path],failure:"Не прошла проверка подписи компонента \(name). Скачайте пакет заново.")
+            for architecture in ["x86_64","arm64"] {
+                try verify(["--display","--arch",architecture,path],failure:"В компоненте \(name) не подтверждена архитектура \(architecture). Нужен полный пакет для Intel и Apple Silicon.")
+            }
         }
     }
     func download(_ release: MacRelease, completion: @escaping (Result<URL, Error>) -> Void) {
