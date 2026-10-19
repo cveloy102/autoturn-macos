@@ -21,7 +21,9 @@ STAGE="$SUPPORT/stage-$$.app"
 # Reject an incomplete or incompatible package before stopping the live helper.
 for COMPONENT in Contents/MacOS/AutoTurn Contents/Library/LaunchServices/AutoTurnHelper Contents/Resources/amneziawg-go Contents/Resources/routing-core; do
  [ -x "$STAGE/$COMPONENT" ]
- /usr/bin/lipo "$STAGE/$COMPONENT" -verify_arch "$(uname -m)"
+ # codesign is shipped with macOS; lipo requires developer tools.
+ /usr/bin/codesign --verify --strict --all-architectures "$STAGE/$COMPONENT"
+ /usr/bin/codesign --display --arch "$(uname -m)" "$STAGE/$COMPONENT"
 done
 HASHES=''
 for ARCH in x86_64 arm64; do

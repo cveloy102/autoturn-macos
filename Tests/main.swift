@@ -224,6 +224,13 @@ if let path = ProcessInfo.processInfo.environment["AT_TEST_BUNDLE"] {
     release.version = bundle.object(forInfoDictionaryKey:"CFBundleShortVersionString") as! String
     release.build = Int(bundle.object(forInfoDictionaryKey:"CFBundleVersion") as! String)!
     try Updater.validateBundle(app,release:release); passed += 1
+    // Reproduce a Mac without usable developer tools. codesign must still work.
+    do {
+        let previous = getenv("DEVELOPER_DIR").map { String(cString:$0) }
+        setenv("DEVELOPER_DIR","/nonexistent-autoturn-developer-tools",1)
+        defer { if let previous = previous { setenv("DEVELOPER_DIR",previous,1) } else { unsetenv("DEVELOPER_DIR") } }
+        try Updater.validateBundle(app,release:release); passed += 1
+    }
     let temporary = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     defer { try? FileManager.default.removeItem(at:temporary) }
     try FileManager.default.createDirectory(at:temporary,withIntermediateDirectories:true)
@@ -236,5 +243,20 @@ if let path = ProcessInfo.processInfo.environment["AT_TEST_BUNDLE"] {
     try signer.run(); signer.waitUntilExit()
     expect(signer.terminationStatus == 0,"Incomplete bundle fixture signing failed")
     do { try Updater.validateBundle(incomplete,release:release); fatalError("Updater accepted a signed bundle missing routing-core") } catch { passed += 1 }
+    // A valid signature alone is insufficient: reject a signed, Intel-only core.
+    let core = incomplete.appendingPathComponent("Contents/Resources/routing-core")
+    let thinner = Process(); thinner.executableURL = URL(fileURLWithPath:"/usr/bin/lipo")
+    thinner.arguments = [app.appendingPathComponent("Contents/Resources/routing-core").path,"-thin","x86_64","-output",core.path]
+    try thinner.run(); thinner.waitUntilExit()
+    expect(thinner.terminationStatus == 0,"Thin routing-core fixture creation failed")
+    let coreSigner = Process(); coreSigner.executableURL = URL(fileURLWithPath:"/usr/bin/codesign")
+    coreSigner.arguments = ["--force","--sign","-",core.path]
+    try coreSigner.run(); coreSigner.waitUntilExit()
+    expect(coreSigner.terminationStatus == 0,"Thin routing-core fixture signing failed")
+    let bundleSigner = Process(); bundleSigner.executableURL = signer.executableURL; bundleSigner.arguments = signer.arguments
+    try bundleSigner.run(); bundleSigner.waitUntilExit()
+    expect(bundleSigner.terminationStatus == 0,"Thin bundle fixture signing failed")
+    do { try Updater.validateBundle(incomplete,release:release); fatalError("Updater accepted a signed Intel-only routing-core") }
+    catch { expect(error.localizedDescription.contains("routing-core") && error.localizedDescription.contains("arm64"),"Missing architecture error must identify component and architecture") }
 }
 print("\(passed) shared checks including malformed OS versions and optional update bundle validation passed")
