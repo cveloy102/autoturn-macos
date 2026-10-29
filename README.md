@@ -11,7 +11,9 @@
 [![Release](https://img.shields.io/github/v/release/cveloy102/autoturn-macos?color=e66c51&label=release)](https://github.com/cveloy102/autoturn-macos/releases/latest)
 [![Build](https://github.com/cveloy102/autoturn-macos/actions/workflows/ci.yml/badge.svg)](https://github.com/cveloy102/autoturn-macos/actions/workflows/ci.yml)
 
-**[Скачать для macOS](https://github.com/cveloy102/autoturn-macos/releases/latest)** · **[Сайт](https://cveloy102.github.io/autoturn-macos/)** · **[Инструкция](docs/usage.md)** · **[Что нового в 1.0](releases/1.0.0/notes.md)**
+**[Скачать для macOS](https://github.com/cveloy102/autoturn-macos/releases/latest)** · **[Сайт](https://cveloy102.github.io/autoturn-macos/)** · **[Инструкция](docs/usage.md)** · **[Что нового в 1.0.4](releases/1.0.4/notes.md)**
+
+**Обновление до 1.0.4 — вручную:** скачайте ZIP и замените только `AutoTurn.app` в «Программах». Старые версии не примут новый ключ обновления. Профили, домашние сети и имеющиеся правила сохраняются отдельно от приложения; данные удалять не нужно. [Подробности перехода](releases/1.0.4/notes.md).
 
 ![Пульт AutoTurn](docs/assets/connection.png)
 
@@ -45,7 +47,7 @@ AutoTurn живёт в верхнем меню macOS. Задайте домаш�
 1. [Скачайте ZIP из последнего релиза](https://github.com/cveloy102/autoturn-macos/releases/latest), распакуйте и перенесите `AutoTurn.app` в «Программы».
 2. Откройте приложение. Если macOS блокирует запуск, разрешите **AutoTurn** в «Системные настройки → Конфиденциальность и безопасность» и повторите запуск.
 3. Импортируйте профиль **AmneziaWG `.conf`** кнопкой или перетаскиванием.
-4. Установите VPN-службу из пульта. Для изменения маршрутов macOS запросит пароль администратора.
+4. Мастер сам проверит службу и при необходимости начнёт установку. Подтвердите системный запрос администратора macOS.
 5. Разрешите определение имени Wi-Fi, добавьте домашнюю сеть и выберите **«Авто»**.
 
 Требуется **macOS 13 или новее**. Один архив для Intel и Apple Silicon, без Rosetta. Приложение подписано ad hoc; Developer ID и нотариализации пока нет. Отключать защиту macOS целиком не требуется. AutoTurn использует ваш VPN-сервер и не предоставляет подписку или сервер.

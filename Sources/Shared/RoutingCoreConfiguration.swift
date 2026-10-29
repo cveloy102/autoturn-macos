@@ -1,9 +1,9 @@
 import Foundation
 
 enum RoutingCoreConfiguration {
-    static func make(_ settings: RoutingSettings, physicalInterface: String, gateway: String, tunnel: String, dns: String, routingInterface: String = "utun99", supportsIPv6: Bool = false) throws -> Data {
+    static func make(_ settings: RoutingSettings, physicalInterface: String, physicalDNS: String, tunnel: String, dns: String, routingInterface: String = "utun99", supportsIPv6: Bool = false) throws -> Data {
         let value = try settings.validated()
-        guard physicalInterface.range(of:"^(en|bridge|eth)[0-9]+$",options:.regularExpression) != nil, [tunnel,routingInterface].allSatisfy({ $0.range(of:"^utun[0-9]+$",options:.regularExpression) != nil }), Profile.isIP(gateway), Profile.isIP(dns) else { throw AppError.message("Некорректные интерфейсы маршрутизации") }
+        guard physicalInterface.range(of:"^(en|bridge|eth)[0-9]+$",options:.regularExpression) != nil, [tunnel,routingInterface].allSatisfy({ $0.range(of:"^utun[0-9]+$",options:.regularExpression) != nil }), Profile.isIP(physicalDNS), Profile.isIP(dns) else { throw AppError.message("Некорректные интерфейсы или DNS маршрутизации") }
         var rules: [[String:Any]] = [["inbound":["routing-in"],"action":"sniff","timeout":"300ms"],["protocol":"dns","action":"hijack-dns"]]
         let enabled = value.rules.filter { $0.enabled }
         // Domain rules precede IP fallback: sharing a CDN IP does not merge flows.
@@ -25,7 +25,7 @@ enum RoutingCoreConfiguration {
             // prefer unreachable IPv6 endpoints instead of using IPv4.
             "inbounds":[["type":"tun","tag":"routing-in","interface_name":routingInterface,"address":supportsIPv6 ? ["172.29.255.1/30","fd99:6175:746f::1/126"] : ["172.29.255.1/30"],"mtu":1280,"auto_route":true,"strict_route":true,"dns_mode":"hijack","stack":"gvisor"]],
             "outbounds":[["type":"direct","tag":"direct","bind_interface":physicalInterface,"domain_resolver":["server":"physical-dns","strategy":"ipv4_only"]],["type":"direct","tag":"vpn","bind_interface":tunnel,"domain_resolver":["server":"vpn-dns","strategy":"ipv4_only"]]],
-            "dns":["servers":[["type":"udp","tag":"physical-dns","server":gateway,"detour":"direct"],["type":"udp","tag":"vpn-dns","server":dns,"detour":"vpn"],["type":"fakeip","tag":"domain-map","inet4_range":"198.18.0.0/15","inet6_range":"fc00::/18"]],"rules":[["query_type":["A","AAAA"],"action":"route","server":"domain-map"]],"final":"physical-dns","strategy":"ipv4_only"],
+            "dns":["servers":[["type":"udp","tag":"physical-dns","server":physicalDNS,"detour":"direct"],["type":"udp","tag":"vpn-dns","server":dns,"detour":"vpn"],["type":"fakeip","tag":"domain-map","inet4_range":"198.18.0.0/15","inet6_range":"fc00::/18"]],"rules":[["query_type":["A","AAAA"],"action":"route","server":"domain-map"]],"final":"physical-dns","strategy":"ipv4_only"],
             "route":["default_interface":physicalInterface,"default_domain_resolver":"physical-dns","rules":rules,"final":"direct"]
         ]
         return try JSONSerialization.data(withJSONObject:config,options:[.sortedKeys])

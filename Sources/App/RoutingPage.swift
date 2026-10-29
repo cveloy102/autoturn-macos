@@ -109,7 +109,7 @@ extension Controller {
         do { settings.routing = try settings.routing.validated() } catch { showError(error); return }
         if preview { buildPage(); return }
         if serviceAvailable && status.routingProtocol != 2 && settings.routing.mode == .rules { info("Сначала установи обновлённую VPN-службу из этой версии приложения"); return }
-        persistAndConfigure(); buildPage()
+        persistAndConfigure(allowRouteChanges:true); buildPage()
     }
     func addRoutingRule(suggestion: String? = nil) {
         popover.performClose(nil)
@@ -184,19 +184,19 @@ extension Controller {
         routingTimer = Timer(timeInterval:60,repeats:true) { [weak self] _ in self?.checkRoutingUpdates() }; RunLoop.main.add(routingTimer!,forMode:.common); checkRoutingUpdates()
     }
     func checkRoutingUpdates() {
-        guard !preview, settings.routing.automaticDatabaseUpdates, !routingBusy else { return }
+        guard !preview, !setup.loadingKeychain, settingsReadError == nil, persistedRouting != nil, settings.routing.automaticDatabaseUpdates, !routingBusy else { return }
         let last = UserDefaults.standard.object(forKey:"routing.lastAttempt") as? Date ?? .distantPast
         if Date().timeIntervalSince(last) >= 86400 { refreshRoutingDatabase(manual:false) }
     }
     func refreshRoutingDatabase(manual: Bool) {
-        guard !routingBusy else { return }; routingBusy = true; UserDefaults.standard.set(Date(),forKey:"routing.lastAttempt"); routingFeedback = "Обновляем каталог и списки сервисов…"; if tab == "Маршруты" { buildPage() }
+        guard !routingBusy, !setup.loadingKeychain, settingsReadError == nil, persistedRouting != nil else { return }; routingBusy = true; UserDefaults.standard.set(Date(),forKey:"routing.lastAttempt"); routingFeedback = "Обновляем каталог и списки сервисов…"; if tab == "Маршруты" { buildPage() }
         routingDatabase.refresh(rules:settings.routing.rules) { [weak self] result in
             guard let self = self else { return }; self.routingBusy = false
             switch result {
             case .success(let snapshot):
                 var updated = self.settings.routing
                 for index in updated.rules.indices { if let id = updated.rules[index].serviceID, let service = snapshot.services[id] { updated.rules[index].baseDomains = service.domains; updated.rules[index].baseIPRanges = nil; updated.rules[index].sourcePath = service.sourcePath } }
-                do { updated.databaseUpdatedAt = snapshot.updatedAt; self.settings.routing = try updated.validated(); self.routingFeedback = "База актуальна. Свои дополнения сохранены."; if !self.preview { self.persistAndConfigure() } } catch { self.routingFeedback = "Правила сохранены без изменений: " + error.localizedDescription }
+                do { updated.databaseUpdatedAt = snapshot.updatedAt; self.settings.routing = try updated.validated(); self.routingFeedback = "База актуальна. Свои дополнения сохранены."; if !self.preview { self.persistAndConfigure(allowRouteChanges:true) } } catch { self.routingFeedback = "Правила сохранены без изменений: " + error.localizedDescription }
             case .failure(let error): self.routingFeedback = "Не удалось обновить базу; работает предыдущая. " + error.localizedDescription
             }
             if self.tab == "Маршруты" { self.buildPage() }

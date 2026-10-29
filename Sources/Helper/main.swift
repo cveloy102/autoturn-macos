@@ -21,16 +21,16 @@ func verifyClient(_ fd: Int32, installation: Installation) -> Bool {
 if let index = CommandLine.arguments.firstIndex(of:"--routing-config-self-check"), index+1 < CommandLine.arguments.count {
     do {
         var settings = RoutingSettings(); settings.mode = .rules; settings.rules = [RoutingRule(name:"YouTube",domains:["youtube.com","googlevideo.com"])]
-        try RoutingCoreConfiguration.make(settings,physicalInterface:"en0",gateway:"192.168.1.1",tunnel:"utun3",dns:"1.1.1.1").write(to:URL(fileURLWithPath:CommandLine.arguments[index+1]))
+        try RoutingCoreConfiguration.make(settings,physicalInterface:"en0",physicalDNS:"192.168.1.53",tunnel:"utun3",dns:"1.1.1.1").write(to:URL(fileURLWithPath:CommandLine.arguments[index+1]))
         print("Routing configuration generated; no system changes"); exit(0)
     } catch { print(error.localizedDescription); exit(1) }
 }
 if CommandLine.arguments.contains("--dns-probe-self-check") {
     do {
         let physical = PhysicalNetwork.read()
-        guard let gateway = physical.gateway, let iface = physical.interface else { throw AppError.message("Physical network unavailable") }
+        guard let dns = physical.dnsServers.first, let iface = physical.interface else { throw AppError.message("Physical network DNS unavailable") }
         let proxy = RoutingDNSProxy(); var count = 0
-        try proxy.start(upstream:gateway,interface:iface) { domain, records in count += records.filter { $0.ip != nil }.count; print("DNS processed domain=\(domain) addressCount=\(records.filter { $0.ip != nil }.count)") }
+        try proxy.start(upstream:dns,interface:iface) { domain, records in count += records.filter { $0.ip != nil }.count; print("DNS processed domain=\(domain) addressCount=\(records.filter { $0.ip != nil }.count)") }
         defer { proxy.stop() }
         let query = Data([0x12,0x34,1,0,0,1,0,0,0,0,0,0,7]+Array("example".utf8)+[3]+Array("com".utf8)+[0,0,1,0,1])
         for tcp in [false,true] {
@@ -43,9 +43,16 @@ if CommandLine.arguments.contains("--dns-probe-self-check") {
         exit(0)
     } catch { print("DNS probe failed: \(error.localizedDescription)"); exit(1) }
 }
+if let index = CommandLine.arguments.firstIndex(of:"--resolve-endpoint-self-check"), index+1 < CommandLine.arguments.count {
+    do {
+        let address = try EndpointResolver.resolve(CommandLine.arguments[index+1],physical:PhysicalNetwork.read())
+        guard !Profile.isRoutingFakeIP(address) else { throw AppError.message("Synthetic endpoint rejected") }
+        print("Physical DNS endpoint lookup passed; real IPv4; no settings, routes or PF changed"); exit(0)
+    } catch { fputs("Endpoint lookup failed: \(error.localizedDescription)\n",stderr); exit(1) }
+}
 if CommandLine.arguments.contains("--self-check") {
     let physical = PhysicalNetwork.read()
-    print("AutoTurn helper protocol 1; primary=\(physical.interface ?? "none"); networkAvailable=\(physical.available); no networking changes performed")
+    print("AutoTurn helper protocol 1; primary=\(physical.interface ?? "none"); networkAvailable=\(physical.available); physicalDNSCount=\(physical.dnsServers.count); dnsMatchesGateway=\(physical.dnsServers.first != nil && physical.dnsServers.first == physical.gateway); no networking changes performed")
     exit(0)
 }
 if let index = CommandLine.arguments.firstIndex(of:"--ipc-test-server"), index+2 < CommandLine.arguments.count {

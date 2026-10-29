@@ -167,10 +167,17 @@ expect(imported.rules == routes.rules,"Route import/export lost rules")
 let routeJSON = String(data:try JSONEncoder().encode(RoutingExport(routing:routes)),encoding:.utf8)!
 expect(!routeJSON.contains("privatekey") && !routeJSON.contains("profiles"),"Route export included VPN keys")
 expect(!RoutingPolicy.validSourcePath("../../secret") && RoutingPolicy.validSourcePath("source2/youtube.txt"),"Database source traversal allowed")
-let ipv4Core = try JSONSerialization.jsonObject(with:RoutingCoreConfiguration.make(routes,physicalInterface:"en0",gateway:"192.168.1.1",tunnel:"utun3",dns:"1.1.1.1")) as! [String:Any]
+let ipv4Core = try JSONSerialization.jsonObject(with:RoutingCoreConfiguration.make(routes,physicalInterface:"en0",physicalDNS:"192.168.1.53",tunnel:"utun3",dns:"1.1.1.1")) as! [String:Any]
+for address in ["198.18.0.0","198.18.0.197","198.19.255.255","fc00::1","fc00:3fff::1"] {
+    expect(Profile.isRoutingFakeIP(address),"Synthetic routing address accepted as a real endpoint: \(address)")
+    do { _ = try profile.uapi(ip:address); fatalError("Synthetic endpoint reached UAPI") } catch {}
+}
+for address in ["198.17.255.255","198.20.0.0","192.0.2.1","fc00:4000::1","fd00::1"] {
+    expect(!Profile.isRoutingFakeIP(address),"Real endpoint rejected outside fake-IP prefix: \(address)")
+}
 let ipv4Inbounds = ipv4Core["inbounds"] as! [[String:Any]]
 expect(ipv4Inbounds[0]["address"] as? [String] == ["172.29.255.1/30"],"IPv4-only VPN falsely advertised IPv6 to Chrome")
-let dualCore = try JSONSerialization.jsonObject(with:RoutingCoreConfiguration.make(routes,physicalInterface:"en0",gateway:"192.168.1.1",tunnel:"utun3",dns:"1.1.1.1",supportsIPv6:true)) as! [String:Any]
+let dualCore = try JSONSerialization.jsonObject(with:RoutingCoreConfiguration.make(routes,physicalInterface:"en0",physicalDNS:"192.168.1.53",tunnel:"utun3",dns:"1.1.1.1",supportsIPv6:true)) as! [String:Any]
 let dualInbounds = dualCore["inbounds"] as! [[String:Any]]
 expect((dualInbounds[0]["address"] as? [String])?.count == 2,"Dual-stack VPN lost IPv6 configuration")
 var telegramRoutes = RoutingSettings(); telegramRoutes.mode = .rules
@@ -181,7 +188,7 @@ telegramRoutes.rules = [telegramRule]; telegramRoutes = try telegramRoutes.valid
 expect(telegramRoutes.rules[0].baseDomains == ["t.me","telegram.org"],"Service IP ranges remained in domain list")
 expect(telegramRoutes.rules[0].allIPRanges.count == 3,"Service IP ranges or manual additions lost")
 expect(RoutingPolicy.addressDestination("149.154.167.51",settings:telegramRoutes) == .vpn,"Telegram IP not routed through VPN")
-let telegramConfig = try JSONSerialization.jsonObject(with:RoutingCoreConfiguration.make(telegramRoutes,physicalInterface:"en0",gateway:"192.168.1.1",tunnel:"utun3",dns:"1.1.1.1")) as! [String:Any]
+let telegramConfig = try JSONSerialization.jsonObject(with:RoutingCoreConfiguration.make(telegramRoutes,physicalInterface:"en0",physicalDNS:"192.168.1.53",tunnel:"utun3",dns:"1.1.1.1")) as! [String:Any]
 let routeConfig = telegramConfig["route"] as! [String:Any]
 expect(routeConfig["final"] as? String == "direct","Unselected or opaque traffic incorrectly defaults to VPN")
 let coreRules = routeConfig["rules"] as! [[String:Any]]
@@ -260,3 +267,135 @@ if let path = ProcessInfo.processInfo.environment["AT_TEST_BUNDLE"] {
     catch { expect(error.localizedDescription.contains("routing-core") && error.localizedDescription.contains("arm64"),"Missing architecture error must identify component and architecture") }
 }
 print("\(passed) shared checks including malformed OS versions and optional update bundle validation passed")
+
+var primarySettings = Settings()
+var second = profile; second.id = UUID().uuidString; second.name = "Primary"
+var third = profile; third.id = UUID().uuidString; third.name = "Reserve"
+primarySettings.profiles = [profile,second,third]; primarySettings.selectedID = profile.id; primarySettings.primaryID = second.id
+expect(primarySettings.connectionOrder.map(\.id) == [second.id,profile.id,third.id],"Primary profile was not first without losing reserve order")
+let primaryRoundTrip = try JSONDecoder().decode(Settings.self,from:JSONEncoder().encode(primarySettings))
+expect(primaryRoundTrip.primaryID == second.id,"Primary profile did not persist")
+var legacyJSON = try JSONSerialization.jsonObject(with:JSONEncoder().encode(primarySettings)) as! [String:Any]
+legacyJSON.removeValue(forKey:"primaryID")
+let migratedPrimary = try JSONDecoder().decode(Settings.self,from:JSONSerialization.data(withJSONObject:legacyJSON))
+expect(migratedPrimary.primaryProfileID == profile.id,"Legacy selection did not migrate to primary")
+primarySettings.profiles.removeAll { $0.id == second.id }
+expect(primarySettings.connectionOrder.map(\.id) == [profile.id,third.id],"Deleted primary produced an invalid profile order")
+var ready = SetupReadiness()
+expect(ready.stage == .keychain,"Setup skipped Keychain access")
+ready.keychainReady = true; expect(ready.stage == .profile,"Setup skipped profile prerequisite")
+ready.profileReady = true; expect(ready.stage == .location,"Setup skipped location access")
+ready.locationGranted = true; expect(ready.stage == .service,"Setup skipped privileged service")
+ready.serviceReady = true; expect(ready.stage == .notifications,"Setup skipped notification choice")
+ready.notificationsSkipped = true; expect(ready.stage == .ready,"Optional notifications blocked VPN setup")
+ready.locationGranted = false; expect(ready.stage == .location,"Revoked location permission was ignored after setup completion")
+ready.locationRequired = false; expect(ready.stage == .ready,"Manual VPN unnecessarily required location")
+ready.serviceReady = false; expect(ready.stage == .service,"Unavailable service was ignored after setup completion")
+print("\(passed) shared checks including primary migration and permission revocation passed")
+let imports = ProfileImportQueue()
+let fileA = URL(fileURLWithPath:"/tmp/drop-one.conf"), fileB = URL(fileURLWithPath:"/tmp/drop-two.CONF")
+expect(imports.enqueue([fileA,fileB]),"Profile drop was rejected while busy")
+expect(imports.takeIfIdle(false) == nil && imports.count == 2,"Busy operation silently consumed dropped profiles")
+expect(imports.enqueue([fileA]) && imports.count == 2,"Repeated drop duplicated a pending profile")
+expect(imports.takeIfIdle(true)?.urls == [fileA,fileB] && imports.count == 0,"Deferred profile drop did not drain after operation finished")
+expect(!imports.enqueue([URL(string:"https://example.com/profile.conf")!]),"Remote URL was treated as a user-authorized local profile file")
+expect(!imports.enqueue([URL(fileURLWithPath:"/tmp/unrelated.txt")]),"Non-profile drop was accepted")
+print("\(passed) shared checks including deferred profile drops passed")
+
+expect(ProfileSelectionDecision.evaluate(target:"reserve",current:"main",busy:false,pending:false,phase:.connected) == .confirm,"Changing profile skipped confirmation")
+expect(ProfileSelectionDecision.evaluate(target:"main",current:"main",busy:false,pending:false,phase:.connected) == .unchanged,"Current profile unnecessarily reconnects")
+for phase in [Phase.connecting,.recovering] {
+ expect(ProfileSelectionDecision.evaluate(target:"reserve",current:"main",busy:false,pending:false,phase:phase) == .wait,"In-flight connection allowed another profile switch")
+}
+expect(ProfileSelectionDecision.evaluate(target:"reserve",current:"main",busy:true,pending:false,phase:.connected) == .wait,"Unacknowledged configure allowed another switch")
+expect(ProfileSelectionDecision.evaluate(target:"reserve",current:"main",busy:false,pending:true,phase:.connected) == .wait,"Pending switch was overwritten by stale connected status")
+ready.locationRequired = true; ready.locationGranted = true; ready.locationChecked = false
+expect(ready.stage == .location,"Unknown location check skipped onboarding")
+ready.locationChecked = true; ready.serviceChecked = false
+expect(ready.stage == .service,"Unfinished service check skipped onboarding")
+ready.serviceChecked = true; ready.serviceInstalling = true
+expect(ready.stage == .service,"In-progress service installation declared ready")
+ready.serviceInstalling = false; ready.serviceReady = true
+expect(ready.stage == .ready,"Granted permissions were not skipped")
+print("\(passed) checks including profile confirmation policy and completed permission steps passed")
+
+var autoState = SetupReadiness()
+autoState.keychainReady = true; autoState.profileReady = true; autoState.locationGranted = true; autoState.notifications = .allowed
+for mode in Mode.allCases {
+ var startupSettings = Settings(); startupSettings.mode = mode
+ var automation = SetupAutomation()
+ expect(automation.next(autoState,busy:false,modal:false,canRequestLocation:false) == .service,"Missing service required a button in mode \(mode)")
+ for _ in 0..<100 { expect(automation.next(autoState,busy:false,modal:false,canRequestLocation:false) == nil,"Cancelled/failed service setup repeated the native prompt") }
+ expect(startupSettings.mode == mode,"Permission setup changed saved VPN mode")
+}
+var automation = SetupAutomation()
+autoState.serviceChecked = false
+expect(automation.next(autoState,busy:false,modal:false,canRequestLocation:false) == nil,"Service install raced its initial availability check")
+autoState.serviceChecked = true
+expect(automation.next(autoState,busy:true,modal:false,canRequestLocation:false) == nil,"Busy startup started another permission prompt")
+expect(automation.next(autoState,busy:false,modal:true,canRequestLocation:false) == nil,"Permission prompt interrupted a modal dialog")
+autoState.serviceReady = true
+expect(automation.next(autoState,busy:false,modal:false,canRequestLocation:false) == nil,"Working service unnecessarily requested installation")
+autoState.serviceReady = false; automation.deferred = true
+expect(automation.next(autoState,busy:false,modal:false,canRequestLocation:false) == nil,"Later did not defer automatic setup")
+automation.deferred = false
+expect(automation.next(autoState,busy:false,modal:false,canRequestLocation:false) == .service,"Resumed setup never requested missing service")
+automation = SetupAutomation(); autoState.locationGranted = false
+expect(automation.next(autoState,busy:false,modal:false,canRequestLocation:false) == nil,"Denied location permission was requested again")
+expect(automation.next(autoState,busy:false,modal:false,canRequestLocation:true) == .location,"Missing location did not request native permission automatically")
+expect(automation.next(autoState,busy:false,modal:false,canRequestLocation:true) == nil,"Native location prompt repeated")
+autoState.locationGranted = true
+expect(automation.next(autoState,busy:false,modal:false,canRequestLocation:false) == .service,"Granting location did not advance to automatic service setup")
+autoState.serviceReady = true; autoState.notifications = .notRequested
+expect(automation.next(autoState,busy:false,modal:false,canRequestLocation:false) == .notifications,"Ready service did not advance to notification prompt")
+autoState.notifications = .allowed
+expect(automation.next(autoState,busy:false,modal:false,canRequestLocation:false) == nil,"Already-complete setup repeated permission prompts")
+print("\(passed) shared checks including automatic setup in Off/Auto/On and cancelled-prompt suppression passed")
+
+func expectRoute(_ value: @autoclosure () throws -> Bool, _ message: String) throws {
+    let result = try value(); expect(result,message)
+}
+let routeDirectory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+defer { try? FileManager.default.removeItem(at:routeDirectory) }
+let routeStore = RoutingPersistence(directory:routeDirectory)
+var originalRoutes = RoutingSettings(); originalRoutes.mode = .rules
+originalRoutes.rules = [RoutingRule(name:"Saved VPN",domains:["saved.example"],destination:.vpn),RoutingRule(name:"Saved direct",ipRanges:["192.0.2.0/24"],destination:.direct)]
+try expectRoute(try routeStore.load(fallback:originalRoutes) == originalRoutes,"Legacy Keychain routes did not migrate")
+try expectRoute(try RoutingExport.read(Data(contentsOf:routeStore.currentURL)) == originalRoutes,"Independent current copy is not a usable route export")
+try expectRoute(try routeStore.load(fallback:RoutingSettings()) == originalRoutes,"Old/empty Keychain snapshot erased routes after app replacement")
+let permissions = try FileManager.default.attributesOfItem(atPath:routeStore.currentURL.path)[.posixPermissions] as! NSNumber
+expect(permissions.intValue == 0o600,"Route backup is not private")
+var editedRoutes = originalRoutes; editedRoutes.rules.append(RoutingRule(name:"Added",domains:["added.example"]))
+try expectRoute(try routeStore.save(editedRoutes,expected:originalRoutes) == editedRoutes,"Route edit was not committed")
+try expectRoute(try routeStore.save(originalRoutes,expected:originalRoutes) == editedRoutes,"Unrelated stale settings save erased a newer route list")
+var conflictingRoutes = originalRoutes; conflictingRoutes.rules.removeLast()
+do { _ = try routeStore.save(conflictingRoutes,expected:originalRoutes); fatalError("Concurrent route edits overwrote each other") }
+catch let conflict as RoutingPersistenceConflict { expect(conflict.current == editedRoutes,"Conflict did not return the current route list") }
+try expectRoute(try routeStore.save(editedRoutes,expected:originalRoutes) == editedRoutes,"Retry after failed Keychain persistence was not idempotent")
+try expectRoute(try RoutingExport.read(Data(contentsOf:routeStore.previousURL)) == originalRoutes,"Previous route snapshot was not retained")
+try Data("damaged current".utf8).write(to:routeStore.currentURL)
+try expectRoute(try routeStore.load(fallback:RoutingSettings()) == originalRoutes,"Damaged current copy was not recovered from previous")
+try expectRoute(try RoutingExport.read(Data(contentsOf:routeStore.currentURL)) == originalRoutes,"Recovered current copy was not repaired")
+let clearedRoutes = RoutingSettings()
+_ = try routeStore.save(clearedRoutes,expected:originalRoutes)
+try expectRoute(try routeStore.load(fallback:editedRoutes) == clearedRoutes,"Explicitly deleted routes were silently resurrected")
+try Data("damaged current".utf8).write(to:routeStore.currentURL)
+try Data("damaged previous".utf8).write(to:routeStore.previousURL)
+do { _ = try routeStore.load(fallback:RoutingSettings()); fatalError("Two damaged copies were overwritten with an empty list") }
+catch is RoutingPersistenceFailure { expect(true,"Damaged copies correctly refused overwrite") }
+try expectRoute(try String(contentsOf:routeStore.currentURL) == "damaged current","Damaged evidence was overwritten")
+print("\(passed) shared checks including reinstall route preservation, stale writers, explicit deletion and backup recovery passed")
+
+if let file = ProcessInfo.processInfo.environment["AT_TEST_ROUTES_EXPORT"] {
+    let actual = try RoutingExport.read(Data(contentsOf:URL(fileURLWithPath:file)))
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at:directory) }
+    let first = RoutingPersistence(directory:directory)
+    try expectRoute(try first.load(fallback:actual) == actual,"Actual exported routes changed during first migration")
+    for _ in 0..<3 {
+        let replacement = RoutingPersistence(directory:directory)
+        try expectRoute(try replacement.load(fallback:RoutingSettings()) == actual,"App replacement erased actual exported routes")
+        try expectRoute(try replacement.save(actual,expected:actual) == actual,"Unrelated settings save changed actual routes")
+    }
+    print("Actual route export preservation passed: \(actual.rules.count) rules, first migration and three simulated app replacements; system settings untouched")
+}

@@ -9,3 +9,6 @@ __pycache__/
 *.pem
 secrets/
 third_party/routing-core/
+/DIAGNOSIS-2026-10-29.md
+/HANDOFF-2026-10-29.md
+/VALIDATION-1.0.4-dev.md

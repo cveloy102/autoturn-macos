@@ -34,6 +34,7 @@ jobs:
         run: |
           AT_TEST_BUNDLE="$PWD/dist/AutoTurn.app" .build/core-tests
           AT_TEST_ROUTING_CORE="$PWD/dist/AutoTurn.app/Contents/Resources/routing-core" .build/audit-tests
+          python3 scripts/test-routing-dns.py "$PWD/dist/AutoTurn.app/Contents/Resources/routing-core"
       - name: Native app, helper, engine and IPC smoke
         run: bash scripts/smoke.sh
       - name: Package release candidate and corresponding source

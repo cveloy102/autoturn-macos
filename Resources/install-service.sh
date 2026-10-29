@@ -71,5 +71,7 @@ EOF
 /usr/sbin/chown root:wheel "/Library/LaunchDaemons/$LABEL.plist"
 /bin/chmod 644 "/Library/LaunchDaemons/$LABEL.plist"
 /bin/launchctl bootstrap system "/Library/LaunchDaemons/$LABEL.plist"
-/bin/launchctl kickstart "system/$LABEL"
+# RunAtLoad starts the service during bootstrap. A redundant kickstart can
+# report an in-progress launch as failure even though installation succeeded.
+# The application verifies authenticated IPC readiness before reporting success.
 echo 'AutoTurn VPN service installed.'

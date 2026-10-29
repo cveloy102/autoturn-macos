@@ -123,16 +123,14 @@ func paintHeading(_ field:NSTextField,_ text:String) {
     if text.hasSuffix("_") { attributed.addAttribute(.foregroundColor,value:Palette.red,range:NSRange(location:(text as NSString).length-1,length:1)) }
     field.attributedStringValue = attributed
 }
-final class ConsoleSurface: NSView {
+final class ConsoleSurface: ProfileDropView {
     let header = NSView(), navigation = NSView(), content = NSView(), bottom = NSView()
     var sidebarAppearance = false
-    var dropped: (([URL]) -> Void)?
     override var isFlipped: Bool { true }
     override init(frame:NSRect) {
         super.init(frame:frame)
         autoresizingMask = [.width,.height]
         for child in [header,navigation,content,bottom] { addSubview(child) }
-        registerForDraggedTypes([.fileURL])
         fill(self)
     }
     required init?(coder:NSCoder) { fatalError() }
@@ -149,39 +147,59 @@ final class ConsoleSurface: NSView {
         bottom.frame = NSRect(x:24,y:bounds.height-46,width:bounds.width-48,height:46)
     }
     override func draw(_ dirtyRect:NSRect) {
+        super.draw(dirtyRect)
         Palette.line.setFill()
         for y in [CGFloat(90),bounds.height-46] { NSRect(x:0,y:y,width:bounds.width,height:1).fill() }
         if sidebarAppearance { NSRect(x:186,y:90,width:1,height:bounds.height-136).fill() }
         else { NSRect(x:0,y:138,width:bounds.width,height:1).fill() }
     }
-    func files(_ sender:NSDraggingInfo) -> [URL] { files(sender.draggingPasteboard) }
-    func files(_ pasteboard:NSPasteboard) -> [URL] {
-        (pasteboard.readObjects(forClasses:[NSURL.self],options:[.urlReadingFileURLsOnly:true]) as? [URL] ?? []).filter { $0.pathExtension.lowercased() == "conf" }
-    }
-    override func draggingEntered(_ sender:NSDraggingInfo) -> NSDragOperation { files(sender).isEmpty ? [] : .copy }
-    override func draggingUpdated(_ sender:NSDraggingInfo) -> NSDragOperation { draggingEntered(sender) }
-    override func prepareForDragOperation(_ sender:NSDraggingInfo) -> Bool { !files(sender).isEmpty }
-    override func performDragOperation(_ sender:NSDraggingInfo) -> Bool { let urls = files(sender); guard !urls.isEmpty else { return false }; dropped?(urls); return true }
+
 }
 
 final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUserNotificationCenterDelegate {
     var settings = Settings(), status = ServiceStatus()
+    var applicationVersion: String {
+        let version = Bundle.main.object(forInfoDictionaryKey:"CFBundleShortVersionString") as? String ?? "—"
+        let build = Bundle.main.object(forInfoDictionaryKey:"CFBundleVersion") as? String ?? "—"
+        return "AutoTurn \(version) · сборка \(build)"
+    }
+    var switchingProfileName: String?
+    var configurationRevision = 0
     var configuredServiceInstance: String?
     var settingsReadError: String?
+    var persistedRouting: RoutingSettings?
     var recoveryRequestedWhileLocked = false
-    func saveSettings() throws {
+    let setup = SetupAssistantState()
+    // Native smoke fixtures exercise the production startup driver without
+    // granting permissions or modifying the user's installed service.
+    var setupTestReadiness: SetupReadiness?
+    var setupTestCanRequestLocation = false
+    var setupTestActionRunner: ((SetupAutomaticAction) -> Void)?
+    let profileImports = ProfileImportQueue()
+    func saveSettings(allowRouteChanges: Bool = false) throws {
         guard settingsReadError == nil else { throw AppError.message("Связка ключей недоступна. Сохранённые профили не изменены.") }
-        try Storage.save(settings)
+        guard let baseline = persistedRouting else { throw AppError.message("Дождись загрузки сохранённых настроек") }
+        do {
+            let routing = try Storage.save(settings,expectedRouting:baseline,allowRouteChanges:allowRouteChanges)
+            settings.routing = routing; persistedRouting = routing
+            setup.keychainError = nil; setup.needsSettingsSave = false
+        }
+        catch let error as RoutingPersistenceConflict {
+            settings.routing = error.current; persistedRouting = error.current
+            routingFeedback = error.localizedDescription; throw error
+        }
+        catch let error as RoutingPersistenceFailure { routingFeedback = error.localizedDescription; throw error }
+        catch { setup.keychainError = error.localizedDescription; setup.needsSettingsSave = true; DispatchQueue.main.async { [weak self] in self?.auditSetup() }; throw error }
     }
     func retrySettings() {
         do {
             var loaded = try Storage.load()
             if recoveryRequestedWhileLocked { loaded.mode = .off }
-            settings = loaded; settingsReadError = nil; recoveryRequestedWhileLocked = false
+            settings = loaded; persistedRouting = loaded.routing; settingsReadError = nil; recoveryRequestedWhileLocked = false
             do { try Storage.restoreLaunchAtLogin(&settings) } catch { showError(error) }
-            if settings.mode == .auto && !settings.homeSSIDs.isEmpty { observer.requestInitialPermission() }
             persistAndConfigure(); buildPage(); observer.report()
         } catch { settingsReadError = error.localizedDescription; buildPage() }
+        setup.loadingKeychain = false; auditSetup(force:true)
     }
     var serviceAvailable = false, busy = false, checkingConnection = false, checkingUpdate = false, polling = false
     var window: NSWindow!, body = NSView(), page = NSStackView(), footer: NSTextField!
@@ -222,33 +240,54 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
     let preview = CommandLine.arguments.contains("--render-preview") || CommandLine.arguments.contains("--ui-self-check")
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        setup.loadingKeychain = !preview
         if let icon = ApplicationArtwork.icon { NSApp.applicationIconImage = icon }
-        if !preview {
-            do { settings = try Storage.load() }
-            catch { settingsReadError = error.localizedDescription }
-            if settingsReadError == nil { do { try Storage.restoreLaunchAtLogin(&settings) } catch { showError(error) } }
-            updater.restoreCandidate()
-        }
+        if !preview { settingsReadError = "Проверяем доступ к сохранённым профилям…"; updater.restoreCandidate() }
         buildWindow(); buildStatusItem()
         if CommandLine.arguments.contains("--ui-self-check") { checkInterface(); return }; if preview { renderPreview(); return }
-        observer.changed = { [weak self] network in guard let self = self else { return }; self.updateHomeNetwork(network); guard self.serviceAvailable else { return }; self.client.send(RPCRequest(command:"network",settings:nil,network:network)) { self.accept($0,quiet:true) } }
-        if settings.mode == .auto && !settings.homeSSIDs.isEmpty { observer.requestInitialPermission() }
+        observer.changed = { [weak self] network in guard let self = self else { return }; self.updateHomeNetwork(network); self.auditSetup(); guard self.serviceAvailable, !self.setup.installingService else { return }; self.client.send(RPCRequest(command:"network",settings:nil,network:network)) { self.accept($0,quiet:true) } }
+        observer.accessChanged = { [weak self] in self?.auditSetup(); self?.updateStatus() }
         NSWorkspace.shared.notificationCenter.addObserver(self,selector:#selector(woke),name:NSWorkspace.didWakeNotification,object:nil)
         refresh()
         timer = Timer(timeInterval:1,repeats:true) { [weak self] _ in
             guard let self = self else { return }
             if self.popover.isShown || self.observeLiveNetwork || Date().timeIntervalSince(self.lastStatusRefresh) >= 5 { self.refresh() }
+            if Date().timeIntervalSince(self.setup.lastRead) >= 15 { self.auditSetup() }
+            self.drainProfileImports()
+            self.advanceAutomaticSetup()
         }
         RunLoop.main.add(timer!,forMode:.common)
         if !CommandLine.arguments.contains("--background") { openWindow() }
         if liveNetworkTest { beginLiveNetworkTest() }
         else { setupAutomaticUpdates(); setupRoutingUpdates() }
+        auditSetup(force:true)
+        DispatchQueue.global(qos:.userInitiated).async { [weak self] in
+            if !Storage.canReadWithoutPrompt() {
+                DispatchQueue.main.sync {
+                    self?.setup.keychainPromptNeeded = true
+                    self?.auditSetup(force:true)
+                }
+            }
+            let result = Result { try Storage.load() }
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                switch result {
+                case .success(var loaded):
+                    if self.recoveryRequestedWhileLocked { loaded.mode = .off }
+                    self.settings = loaded; self.persistedRouting = loaded.routing; self.settingsReadError = nil
+                    do { try Storage.restoreLaunchAtLogin(&self.settings) } catch { self.showError(error) }
+                case .failure(let error): self.settingsReadError = error.localizedDescription
+                }
+                self.setup.loadingKeychain = false
+                self.buildPage(); self.updateStatus(); self.refresh(); self.observer.report(); self.auditSetup(force:true)
+            }
+        }
     }
     func buildWindow() {
         window = NSWindow(contentRect:NSRect(x:0,y:0,width:760,height:700),styleMask:[.titled,.closable,.miniaturizable,.resizable],backing:.buffered,defer:false)
         window.title = "AutoTurn / Пульт"; window.contentMinSize = NSSize(width:700,height:700); window.delegate = self; window.isReleasedWhenClosed = false; window.appearance = NSAppearance(named:.darkAqua); window.backgroundColor = Palette.bg
         let container = ConsoleSurface(frame:NSRect(x:0,y:0,width:760,height:700)); window.contentView = container
-        container.dropped = { [weak self] files in self?.importProfiles(files) }
+        container.dropped = { [weak self] files in self?.acceptProfileDrop(files) ?? false }
         let mark = NSImageView(frame:.zero); mark.image = ApplicationArtwork.icon; mark.imageScaling = .scaleProportionallyUpOrDown; mark.translatesAutoresizingMaskIntoConstraints = false
         mark.widthAnchor.constraint(equalToConstant:33).isActive = true; mark.heightAnchor.constraint(equalToConstant:33).isActive = true
         let word = label("AUTOTURN_",size:23)
@@ -262,7 +301,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
         body = container.content
         let credit = stack([label("powered by",size:11,color:Palette.dim),label("LENCHA_",size:11,color:Palette.red)],vertical:false,spacing:7)
         footer = label("ПОДГОТОВКА",size:11,color:Palette.dim)
-        let foot = stack([credit,NSView(),footer],vertical:false); pin(foot,inside:container.bottom,inset:0)
+        let foot = stack([credit,NSView(),label(applicationVersion,size:10,color:Palette.dim),NSView(),footer],vertical:false); pin(foot,inside:container.bottom,inset:0)
         buildPage(); window.center()
     }
     func buildNavigation() {
@@ -298,11 +337,12 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
         body.subviews.forEach { $0.removeFromSuperview() }; page = stack(spacing:10); let scroll = StackScroll(page); pin(scroll,inside:body,inset:0)
         consoleProfileButtons = []; consoleEventsField = nil; connectionCheckField = nil
         connectionTitle = nil; connectionMessage = nil; connectionNetwork = nil; connectionProfile = nil; connectionGuard = nil
+        if profileImports.count > 0 { page.addArrangedSubview(label("Профилей в очереди: \(profileImports.count). Импорт начнётся после текущей операции и проверки доступа.",size:11,color:Palette.green)) }
         if let error = settingsReadError {
-            page.addArrangedSubview(label("Связка ключей недоступна_",size:22))
+            page.addArrangedSubview(label(setup.loadingKeychain ? "Читаем сохранённые профили_" : "Связка ключей недоступна_",size:22))
             page.addArrangedSubview(label(error + "\nРазблокируй Связку ключей и повтори чтение. Сохранённые профили не изменены.",size:13,color:Palette.dim))
             page.addArrangedSubview(label(connectionDescription(),size:13))
-            page.addArrangedSubview(ActionButton("Повторить чтение профилей",primary:true) { [weak self] in self?.retrySettings() })
+            if !setup.loadingKeychain { page.addArrangedSubview(ActionButton("Повторить чтение профилей",primary:true) { [weak self] in self?.retrySettings() }) }
             page.addArrangedSubview(ActionButton("Восстановить обычный интернет") { [weak self] in self?.emergencyRestore() })
         } else { switch tab {
         case "Маршруты": routingPage()
@@ -359,8 +399,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
         right.addArrangedSubview(label("ПРОФИЛИ / ПО ПОРЯДКУ",size:10,color:Palette.dim))
         for profile in settings.profiles.prefix(3) {
             let current = profile.id == (status.profileID ?? settings.selectedID)
-            let button = ActionButton(String(profile.name.prefix(19)),primary:current) { [weak self] in self?.settings.selectedID = profile.id; self?.persistAndConfigure() }
-            button.rowStyle = true; button.profileSubtitle = "AmneziaWG"; button.profileState = current ? "выбран" : "резерв"; button.profileMark = current ? "✓" : "·"; button.font = NSFont.monospacedSystemFont(ofSize:11,weight:.regular); button.toolTip = profile.name
+            let button = ActionButton(String(profile.name.prefix(19)),primary:current) { [weak self] in self?.requestProfileSwitch(profile) }
+            button.rowStyle = true; button.profileSubtitle = profile.id == settings.primaryProfileID ? "Основной · AmneziaWG" : "AmneziaWG"; button.profileState = current ? "выбран" : "резерв"; button.profileMark = current ? "✓" : "·"; button.font = NSFont.monospacedSystemFont(ofSize:11,weight:.regular); button.toolTip = profile.name
             right.addArrangedSubview(button)
             button.heightAnchor.constraint(equalToConstant:50).isActive = true; button.widthAnchor.constraint(equalTo:right.widthAnchor).isActive = true
             consoleProfileButtons.append((profile,button))
@@ -387,22 +427,27 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
         page.addArrangedSubview(label("[ 02 / PROFILES ]",size:11,color:Palette.red)); page.addArrangedSubview(heading("Свои сети_")); page.addArrangedSubview(label("Проверяем по порядку. Одновременно работает один VPN.",color:Palette.dim))
         page.addArrangedSubview(ActionButton("+ Добавить профиль",primary:true) { [weak self] in self?.importProfile() })
         page.addArrangedSubview(label("Выбери .conf или перетащи файлы в окно. Можно добавить несколько.",size:11,color:Palette.dim))
+        page.addArrangedSubview(profileDropZone { [weak self] in self?.acceptProfileDrop($0) ?? false })
         let list = stack(spacing:8)
         let scroll = StackScroll(list)
         if settings.profiles.isEmpty { list.addArrangedSubview(label("Профилей пока нет. Добавь конфигурацию AmneziaWG.",color:Palette.dim)) }
         for (index,profile) in settings.profiles.enumerated() {
             let row = stack(vertical:false,spacing:6)
             let active = profile.id == (status.profileID ?? settings.selectedID)
-            let select = ActionButton("\(active ? "✓" : String(index+1))  \(String(profile.name.prefix(consoleAppearance == .workspace ? 14 : 28)))",primary:active) { [weak self] in self?.settings.selectedID = profile.id; self?.persistAndConfigure() }
+            let select = ActionButton("\(active ? "✓" : String(index+1))  \(String(profile.name.prefix(consoleAppearance == .workspace ? 14 : 22)))",primary:active) { [weak self] in self?.requestProfileSwitch(profile) }
             select.rowStyle = true; select.setContentHuggingPriority(.init(1),for:.horizontal); row.addArrangedSubview(select)
             let protocolLabel = label("AWG 3.1",size:11,color:Palette.dim); protocolLabel.widthAnchor.constraint(equalToConstant:68).isActive = true; row.addArrangedSubview(protocolLabel)
             row.addArrangedSubview(ActionButton("↑") { [weak self] in guard let self = self, index > 0 else { return }; self.settings.profiles.swapAt(index,index-1); self.persistAndConfigure() })
             row.addArrangedSubview(ActionButton("↓") { [weak self] in guard let self = self, index+1 < self.settings.profiles.count else { return }; self.settings.profiles.swapAt(index,index+1); self.persistAndConfigure() })
+            let primary = profile.id == settings.primaryProfileID
+            let primaryButton = ActionButton(primary ? "★ Основной" : "☆ Основной",primary:primary) { [weak self] in self?.settings.primaryID = profile.id; self?.persistAndConfigure() }
+            primaryButton.toolTip = "Каждое новое подключение начинается с основного профиля. При отказе используются резервные."
+            row.addArrangedSubview(primaryButton)
             row.addArrangedSubview(ActionButton("Удалить") { [weak self] in self?.removeProfile(profile) })
             list.addArrangedSubview(row); row.widthAnchor.constraint(equalTo:list.widthAnchor).isActive = true
         }
         scroll.heightAnchor.constraint(equalToConstant:210).isActive = true; page.addArrangedSubview(scroll)
-        page.addArrangedSubview(label("В первой версии весь интернет идёт через VPN. Правила AllowedIPs из файла заменяются полным туннелем; скрипты не выполняются.",size:11,color:Palette.dim))
+        page.addArrangedSubview(label("Новое подключение всегда начинается с основного профиля. Если он не отвечает — пробуем резервные по порядку. На рабочем резерве остаёмся до следующего подключения.",size:11,color:Palette.dim))
     }
     func homePage() {
         page.addArrangedSubview(label("[ 03 / TRUSTED NETWORKS ]",size:11,color:Palette.red)); page.addArrangedSubview(heading("Дома — без VPN_")); page.addArrangedSubview(label("Маршруты уже настроены на роутере.",color:Palette.dim))
@@ -428,6 +473,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
     func settingsPage() {
         page.addArrangedSubview(label("[ 05 / PREFERENCES ]",size:11,color:Palette.red))
         page.addArrangedSubview(heading("Настройки_"))
+        page.addArrangedSubview(label(applicationVersion,size:12,color:Palette.dim))
+        page.addArrangedSubview(ActionButton("Проверить разрешения и настройку…",primary:true) { [weak self] in self?.auditSetup(force:true); self?.presentSetupIfNeeded(explicit:true) })
         page.addArrangedSubview(label("ОФОРМЛЕНИЕ ШТОРКИ",size:11,color:Palette.dim))
         let options = stack(vertical:false,spacing:8)
         for style in MenuAppearance.allCases {
@@ -574,8 +621,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
         for profile in shown {
             let index = settings.profiles.firstIndex { $0.id == profile.id } ?? 0
             let selected = profile.id == currentID
-            let button = ActionButton(profile.name,primary:selected) { [weak self] in self?.settings.selectedID = profile.id; self?.persistAndConfigure() }
-            button.rowStyle = true; button.profileSubtitle = "AmneziaWG"; button.profileMark = selected ? "✓" : String(format:"%02d",index+1)
+            let button = ActionButton(profile.name,primary:selected) { [weak self] in self?.requestProfileSwitch(profile) }
+            button.rowStyle = true; button.profileSubtitle = profile.id == settings.primaryProfileID ? "Основной · AmneziaWG" : "AmneziaWG"; button.profileMark = selected ? "✓" : String(format:"%02d",index+1)
             button.profileState = selected ? (status.phase == .connected ? "активен" : status.phase == .home || status.phase == .off ? "готов" : "проверка") : "резерв"
             button.toolTip = profile.name; place(button,50); y += 50
         }
@@ -601,7 +648,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
         view.frame.size.height = y; return view
     }
     func menuRevision() -> String {
-        ([settings.mode.rawValue,settings.routing.mode.rawValue,status.phase.rawValue,connectionDescription(),status.network,status.profileID ?? "",settings.selectedID ?? "",String(status.guardActive),String(serviceAvailable),String(checkingConnection),String(updater.candidate?.build ?? 0),menuAppearance.rawValue,status.verifiedAt.map { String($0.timeIntervalSince1970) } ?? ""] + settings.profiles.map { $0.id + $0.name }).joined(separator:"\u{1f}")
+        ([settings.mode.rawValue,settings.routing.mode.rawValue,status.phase.rawValue,switchingProfileName ?? "",connectionDescription(),status.network,status.profileID ?? "",settings.selectedID ?? "",String(status.guardActive),String(serviceAvailable),String(checkingConnection),String(updater.candidate?.build ?? 0),menuAppearance.rawValue,status.verifiedAt.map { String($0.timeIntervalSince1970) } ?? ""] + settings.profiles.map { $0.id + $0.name }).joined(separator:"\u{1f}")
     }
     func refreshOpenMenu() {
         guard popover.isShown, renderedMenuRevision != menuRevision() else { return }
@@ -642,9 +689,10 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
         return network.available && network.ssid == nil
     }
     func connectionDescription() -> String {
-        needsLocationPermission() ? "Разреши геолокацию для определения домашнего Wi-Fi. Пока сеть не определена, VPN остаётся включён." : status.message
+        if let name = switchingProfileName { return "Переключаемся на «\(name)». Дождись завершения подключения и проверки связи." }
+        return needsLocationPermission() ? "Разреши геолокацию для определения домашнего Wi-Fi. Пока сеть не определена, VPN остаётся включён." : status.message
     }
-    func titleForStatus() -> String { switch status.phase { case .setup:return "Начнём с профиля_"; case .home:return "Ты дома_"; case .connecting:return "Проверяем связь_"; case .connected:return "Под защитой_"; case .waiting:return "Ждём сеть_"; case .recovering:return "Восстанавливаем_"; case .off:return "Выключено вручную_"; case .error:return "Нужно внимание_" } }
+    func titleForStatus() -> String { if switchingProfileName != nil { return "Переключаем профиль_" }; switch status.phase { case .setup:return "Начнём с профиля_"; case .home:return "Ты дома_"; case .connecting:return "Проверяем связь_"; case .connected:return "Под защитой_"; case .waiting:return "Ждём сеть_"; case .recovering:return "Восстанавливаем_"; case .off:return "Выключено вручную_"; case .error:return "Нужно внимание_" } }
     func verificationDescription() -> String {
         if checkingConnection { return "Проверяем HTTPS через VPN…" }
         if status.phase == .home { return "VPN не требуется" }
@@ -700,13 +748,18 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
         if case .success(let reply) = result { configuredServiceInstance = reply.status.serviceInstance }
     }
     func accept(_ result: Result<RPCResponse,Error>, quiet: Bool = false) {
+        setup.serviceChecked = true
         switch result { case .success(let response):serviceAvailable = true; status = response.status; if !response.ok && !quiet { showError(AppError.message(response.error ?? "Ошибка службы")) }; case .failure(let error):serviceAvailable = false; status.phase = .setup; status.message = FileManager.default.fileExists(atPath:"/Library/LaunchDaemons/ru.hl100.autoturn.helper.plist") ? "Служба недоступна. Её состояние и блокировку сейчас подтвердить нельзя." : "Импортируй AmneziaWG .conf и установи VPN-службу"; if !quiet { showError(error) } }
+        if !busy && [.connected,.off,.home,.error,.setup,.waiting].contains(status.phase) { switchingProfileName = nil }
+        if !busy, status.phase == .connected, let id = status.profileID, settings.profiles.contains(where:{ $0.id == id }) { settings.selectedID = id }
         updateStatus()
+        auditSetup()
     }
     func emergencyRestore() {
         popover.performClose(nil)
         guard !recoveringNetwork else { return }; recoveringNetwork = true
         if settingsReadError != nil { recoveryRequestedWhileLocked = true }
+        configurationRevision += 1
         settings.mode = .off
         do { if !preview { try saveSettings() } } catch { routingFeedback = "Режим выключен; сохранить настройки не удалось: " + error.localizedDescription }
         busy = true
@@ -732,6 +785,12 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
         }
     }
     func command(_ command: String) {
+        if command == "next" {
+            let profiles = settings.connectionOrder
+            guard profiles.count > 1 else { return }
+            let index = profiles.firstIndex { $0.id == (status.profileID ?? settings.selectedID) } ?? 0
+            requestProfileSwitch(profiles[(index+1) % profiles.count]); return
+        }
         guard !busy else { return }
         guard serviceAvailable else { showError(AppError.message("Сначала импортируй профиль и установи VPN-службу")); return }
         if command == "check" {
@@ -751,34 +810,66 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
                 self.buildPage(); self.refreshOpenMenu()
                 if case .success(let response) = result, response.ok {
                     if response.status.phase == .connected, let verified = response.status.verifiedAt, verified >= startedAt {
-                        self.info("Доступ в интернет через VPN подтверждён HTTPS-запросом. " + self.verificationDescription())
+                        self.info("Доступ в интернет через VPN подтверждён HTTPS-запросом. " + self.verificationDescription() + (self.settings.routing.mode == .rules ? " Проверка туннеля не проверяет прямой доступ сайтов в режиме «По правилам»." : ""))
                     } else {
-                        self.info("Проверка завершена: " + response.status.message)
+                        self.info(response.status.phase == .connecting ? "Проверка запущена. Дождись нового времени HTTPS в поле «Проверка» или сообщения об ошибке." : "Доступ через VPN пока не подтверждён: " + response.status.message)
                     }
                 }
             }
         }
     }
-    func persistAndConfigure() {
-        do { try saveSettings() } catch { showError(error); return }
+    func requestProfileSwitch(_ profile: Profile) {
+        guard settings.profiles.contains(where:{ $0.id == profile.id }) else { return }
+        let decision = ProfileSelectionDecision.evaluate(target:profile.id,current:status.profileID ?? settings.selectedID,busy:busy,pending:switchingProfileName != nil,phase:status.phase)
+        if decision == .wait {
+            let name = switchingProfileName ?? status.profileName ?? selectedProfile()?.name ?? "VPN"
+            info("Сейчас идёт подключение или проверка профиля «\(name)». Дождись завершения, затем выбери другой профиль. Чтобы прервать подключение, нажми «Выключить».")
+            return
+        }
+        guard decision == .confirm else { return }
+        let detail = status.phase == .off || status.phase == .home ? "Выбрать профиль «\(profile.name)»? VPN сейчас отключён и включаться не будет." : "Текущее VPN-соединение будет прервано. Подключимся к «\(profile.name)» и проверим связь. До завершения проверки переключение на другие профили недоступно."
+        guard confirm("Переключить профиль на «\(profile.name)»?",detail:detail) else { return }
+        // A native confirmation runs its own event loop; state may change while
+        // the dialog is open. Never start a second switch in that interval.
+        guard !busy, switchingProfileName == nil, status.phase != .connecting, status.phase != .recovering else {
+            info("Подключение уже началось. Дождись завершения и повтори выбор."); return
+        }
+        switchingProfileName = profile.name
+        settings.selectedID = profile.id
+        persistAndConfigure()
+        if !busy { switchingProfileName = nil }
+        updateStatus()
+    }
+    func persistAndConfigure(allowRouteChanges: Bool = false) {
+        do { try saveSettings(allowRouteChanges:allowRouteChanges) } catch { showError(error); return }
         buildPage()
         guard serviceAvailable else { return }; busy = true
-        client.send(RPCRequest(command:"configure",settings:settings,network:observer.snapshot())) { [weak self] result in self?.recordConfiguredInstance(result); self?.busy = false; self?.accept(result); self?.observer.report() }
+        configurationRevision += 1
+        let revision = configurationRevision
+        client.send(RPCRequest(command:"configure",settings:settings,network:observer.snapshot())) { [weak self] result in
+            guard let self = self, revision == self.configurationRevision else { return }
+            self.recordConfiguredInstance(result); self.busy = false; self.accept(result); self.observer.report()
+        }
     }
     func setMode(_ mode: Mode) {
         if mode == .off && !liveNetworkTest && !confirm("Отключить VPN?",detail:"Вне дома интернет сможет идти напрямую. Автоматика будет выключена до возврата в Авто.") { return }
         guard mode == .off || !settings.profiles.isEmpty else { tab = "Профили"; openWindow(); return }
         if settingsReadError != nil { guard mode == .off else { openWindow(); return }; recoveryRequestedWhileLocked = true }
+        if mode != .off, let baseline = persistedRouting {
+            do { settings.routing = try Storage.routingStore.load(fallback:baseline); persistedRouting = settings.routing }
+            catch { showError(error); return }
+        }
         settings.mode = mode
-        if mode == .auto && !settings.homeSSIDs.isEmpty { observer.requestInitialPermission() }
         buildPage(); refreshOpenMenu()
+        configurationRevision += 1
+        let revision = configurationRevision
         let snapshot = settings
         // Apply the user's network action before Keychain persistence. In particular,
         // Off must not depend on reading/validating profiles or an unlocked Keychain.
         busy = true
         let request = mode == .off ? RPCRequest(command:"stop",settings:nil,network:nil) : RPCRequest(command:"configure",settings:snapshot,network:observer.snapshot())
         client.send(request) { [weak self] result in
-            guard let self = self else { return }
+            guard let self = self, revision == self.configurationRevision else { return }
             self.recordConfiguredInstance(result); self.accept(result); self.observer.report()
             do { try self.saveSettings() } catch { self.info("Режим применён к службе, но настройки не сохранены: " + error.localizedDescription) }
             self.busy = false
@@ -789,21 +880,69 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
         panel.title = "Добавить профиль AmneziaWG"; panel.prompt = "Добавить"
         guard panel.runModal() == .OK else { return }; importProfiles(panel.urls)
     }
-    func importProfiles(_ files:[URL]) {
+    func acceptProfileDrop(_ files:[URL]) -> Bool {
+        guard profileImports.enqueue(files) else { return false }
+        buildPage(); auditSetup()
+        if settingsReadError != nil || setup.keychainError != nil { presentSetupIfNeeded(explicit:true) }
+        drainProfileImports()
+        return true
+    }
+    func drainProfileImports() {
+        if !preview && !busy && !setup.loadingKeychain && settingsReadError == nil && setup.keychainError == nil && setup.needsSettingsSave { persistAndConfigure(); return }
+        guard !preview, let batch = profileImports.takeIfIdle(!busy && !setup.loadingKeychain && settingsReadError == nil && setup.keychainError == nil) else { return }
+        importProfiles(batch.urls,access:batch)
+    }
+    func importProfiles(_ files:[URL], access:ProfileImportBatch? = nil) {
         guard !busy, !files.isEmpty else { return }
         guard files.allSatisfy({ $0.isFileURL && $0.pathExtension.lowercased() == "conf" }) else { showError(AppError.message("Нужен файл AmneziaWG с расширением .conf")); return }
         guard settingsReadError == nil else { openWindow(); return }
         busy = true
-        DispatchQueue.global().async { let result = Result { try files.map { file -> Profile in var profile = try Profile.parse(String(contentsOf:file,encoding:.utf8),name:file.deletingPathExtension().lastPathComponent); profile.resolvedIP = try Storage.resolve(profile.endpointHost); return profile } }; DispatchQueue.main.async { self.busy = false; switch result { case .success(let profiles): guard self.settings.profiles.count + profiles.count <= 32 else { self.showError(AppError.message("Максимум 32 профиля")); return }; self.tab = "Профили"; self.settings.profiles += profiles; if self.settings.selectedID == nil { self.settings.selectedID = profiles.first?.id }; self.persistAndConfigure(); case .failure(let error):self.showError(error) } } }
+        let batch = access ?? ProfileImportBatch(files)
+        // The helper resolves server names through the physical network at
+        // connection time. The system resolver here may be our own fake-IP DNS.
+        DispatchQueue.global().async { let result = Result { try batch.urls.map { file -> Profile in try Profile.parse(String(contentsOf:file,encoding:.utf8),name:file.deletingPathExtension().lastPathComponent) } }; DispatchQueue.main.async { self.busy = false; switch result { case .success(let profiles): guard self.settings.profiles.count + profiles.count <= 32 else { self.showError(AppError.message("Максимум 32 профиля")); return }; self.tab = "Профили"; self.settings.profiles += profiles; if self.settings.selectedID == nil { self.settings.selectedID = profiles.first?.id }; if self.settings.primaryID == nil { self.settings.primaryID = self.settings.primaryProfileID }; self.persistAndConfigure(); case .failure(let error):self.showError(error) } } }
     }
-    func removeProfile(_ profile: Profile) { guard confirm("Удалить \(profile.name)?",detail:"Профиль будет удалён из Keychain приложения.") else { return }; settings.profiles.removeAll { $0.id == profile.id }; if settings.selectedID == profile.id { settings.selectedID = settings.profiles.first?.id }; if settings.profiles.isEmpty { settings.mode = .off }; persistAndConfigure() }
+    func removeProfile(_ profile: Profile) { guard confirm("Удалить \(profile.name)?",detail:"Профиль будет удалён из Keychain приложения.") else { return }; settings.profiles.removeAll { $0.id == profile.id }; if settings.selectedID == profile.id { settings.selectedID = settings.profiles.first?.id }; if settings.primaryID == profile.id { settings.primaryID = settings.profiles.first?.id }; if settings.profiles.isEmpty { settings.mode = .off }; persistAndConfigure() }
     @objc func toggleLogin(_ sender: NSButton) { do { try Storage.setLaunchAtLogin(sender.state == .on); settings.launchAtLogin = sender.state == .on; try saveSettings() } catch { sender.state = settings.launchAtLogin ? .on : .off; showError(error) } }
     @objc func woke() { observer.report(); refresh(); checkAutomaticUpdates(); checkRoutingUpdates() }
-    func installService() {
+    func installService(automatic: Bool = false) {
+        guard !busy, !setup.installingService else { return }
         guard !settings.profiles.isEmpty else { tab = "Профили"; openWindow(); return }
-        guard confirm("Установить VPN-службу AutoTurn?",detail:"Служба получит права администратора для нашего туннеля, DNS и блокировки прямого трафика. После установки начнёт работать выбранный режим. Это тестовая сборка: подготовь возможность отключить VPN через меню.") else { return }
+        setup.automation.noteServiceRequest()
+        busy = true; setup.serviceChecked = false; setup.serviceMessage = "Проверяем существующую VPN-службу…"; auditSetup()
+        ServiceVerification.wait(attempts:automatic ? 4 : 1,request:{ done in self.client.send(RPCRequest(command:"status",settings:nil,network:nil),completion:done) },schedule:{ retry in DispatchQueue.main.asyncAfter(deadline:.now()+0.4,execute:retry) }) { [weak self] result in
+            guard let self = self else { return }
+            self.busy = false; self.accept(result,quiet:true)
+            if case .success(let reply) = result, reply.ok {
+                self.setup.serviceMessage = ""; self.persistAndConfigure(); self.auditSetup(); return
+            }
+            self.beginServiceInstallation(automatic:automatic)
+        }
+    }
+    func beginServiceInstallation(automatic: Bool = false) {
+        let installed = FileManager.default.fileExists(atPath:"/Library/LaunchDaemons/ru.hl100.autoturn.helper.plist")
+        let title = installed ? "Обновить VPN-службу AutoTurn?" : "Установить VPN-службу AutoTurn?"
+        guard automatic || confirm(title,detail:"Служба создаёт VPN, DNS и защиту трафика с правами администратора. Приложение проверит её готовность после установки. Подтверди системный запрос macOS.") else { setup.serviceMessage = ""; auditSetup(); return }
         guard let script = Bundle.main.url(forResource:"install-service",withExtension:"sh") else { showError(AppError.message("Установщик не найден")); return }
-        runInstaller(script:script, app:Bundle.main.bundleURL) { result in switch result { case .success: self.serviceAvailable = true; self.persistAndConfigure(); case .failure(let error):self.showError(error) } }
+        setup.installingService = true; setup.serviceMessage = "Устанавливаем и запускаем VPN-службу…"; auditSetup()
+        runInstaller(script:script,app:Bundle.main.bundleURL) { [weak self] installerResult in
+            guard let self = self else { return }
+            self.busy = true; self.setup.serviceMessage = "Ожидаем ответ VPN-службы…"; self.auditSetup()
+            ServiceVerification.wait(request:{ done in self.client.send(RPCRequest(command:"status",settings:nil,network:nil),completion:done) },schedule:{ retry in DispatchQueue.main.asyncAfter(deadline:.now()+0.3,execute:retry) }) { result in
+                self.setup.installingService = false; self.busy = false
+                self.accept(result,quiet:true)
+                if case .success(let reply) = result, reply.ok {
+                    self.setup.serviceMessage = ""; self.persistAndConfigure()
+                } else {
+                    let detail: String
+                    if case .failure(let error) = installerResult { detail = error.localizedDescription }
+                    else { detail = "Служба ещё не ответила. Нажми «Проверить службу» для повторной проверки." }
+                    self.setup.serviceMessage = detail
+                    self.showError(AppError.message(detail))
+                }
+                self.buildPage(); self.auditSetup()
+            }
+        }
     }
     func runInstaller(script: URL, app: URL, completion: @escaping (Result<Void,Error>) -> Void) {
         busy = true
@@ -813,9 +952,6 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
     }
     func setupAutomaticUpdates() {
         let center = UNUserNotificationCenter.current(); center.delegate = self
-        center.getNotificationSettings { settings in
-            if settings.authorizationStatus == .notDetermined { center.requestAuthorization(options:[.alert]) { _,_ in } }
-        }
         updateTimer = Timer(timeInterval:60,repeats:true) { [weak self] _ in self?.checkAutomaticUpdates() }
         RunLoop.main.add(updateTimer!,forMode:.common)
         checkAutomaticUpdates()
@@ -902,7 +1038,10 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
         }
     }
     func quit() { guard confirm("Отключить VPN и завершить?",detail:"Вне дома будет разрешён прямой интернет. Закрытие одного пульта не отключает VPN.") else { return }; if serviceAvailable { busy = true; client.send(RPCRequest(command:"stop",settings:nil,network:nil)) { result in self.busy = false; switch result { case .success(let response) where response.ok: NSApp.terminate(nil); default:self.accept(result); self.info("Не удалось подтвердить остановку службы. AutoTurn остаётся открыт.") } } } else { NSApp.terminate(nil) } }
-    func windowShouldClose(_ sender:NSWindow) -> Bool { sender.orderOut(nil); return false }
+    func windowShouldClose(_ sender:NSWindow) -> Bool {
+        if sender === setup.window { setup.reviewing = false; setup.automation.deferred = true }
+        sender.orderOut(nil); return false
+    }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender:NSApplication) -> Bool { false }
     func confirm(_ title:String,detail:String) -> Bool { popover.performClose(nil); NSApp.activate(ignoringOtherApps:true); let alert = ApplicationArtwork.alert(title:title,detail:detail); alert.addButton(withTitle:"Продолжить"); alert.addButton(withTitle:"Отмена"); return alert.runModal() == .alertFirstButtonReturn }
     func showError(_ error:Error) { info(error.localizedDescription) }
@@ -1004,6 +1143,67 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
         }
         require(iconImages.count == StatusIcon.allCases.count,"status icons must differ visually")
         require(StatusIcon.state(.home,missingLocation:false) == .home && StatusIcon.state(.connected,missingLocation:false) == .connected && StatusIcon.state(.connected,missingLocation:true) == .unknown,"status icon home/VPN/permission mapping")
+        var grantedReview = SetupReadiness()
+        grantedReview.keychainReady = true; grantedReview.profileReady = true; grantedReview.locationGranted = true; grantedReview.serviceReady = true; grantedReview.notifications = .allowed
+        setupTestReadiness = grantedReview
+        presentSetupIfNeeded(explicit:true)
+        require(setup.window?.isVisible == true && setup.reviewing,"Manual permission check did not show completed setup")
+        for _ in 0..<100 { presentSetupIfNeeded() }
+        require(setup.window?.isVisible == true,"Background permission audit dismissed manual success window")
+        require(buttons(setup.window!.contentView!).contains { $0.title == "Готово" },"Manual permission success has no close action")
+        performSetupAction(.finish)
+        require(setup.window?.isVisible == false && !setup.reviewing,"Done did not dismiss manual permission result")
+        presentSetupIfNeeded()
+        require(setup.window?.isVisible == false,"Automatic launch unnecessarily reopened completed setup")
+        presentSetupIfNeeded(explicit:true)
+        _ = windowShouldClose(setup.window!)
+        require(!setup.reviewing && setup.window?.isVisible == false,"Window close left manual review active")
+        setupTestReadiness = nil; setup.automation = SetupAutomation()
+        var setupPolicy = SetupReadiness()
+        require(!SetupAssistantState.shouldOffer(setupPolicy,newBuild:false,loadingKeychain:true,serviceChecked:false),"Routine launch opened permissions while cached profiles were still loading")
+        require(!SetupAssistantState.shouldOffer(setupPolicy,newBuild:true,loadingKeychain:true,serviceChecked:false),"Update opened a permission step before checking existing access")
+        require(SetupAssistantState.shouldOffer(setupPolicy,newBuild:true,loadingKeychain:true,serviceChecked:false,keychainPromptNeeded:true),"Keychain prompt lost its explanation")
+        setupPolicy.keychainReady = true; setupPolicy.profileReady = true; setupPolicy.locationGranted = true; setupPolicy.serviceReady = true; setupPolicy.notifications = .allowed
+        require(!SetupAssistantState.shouldOffer(setupPolicy,newBuild:false,loadingKeychain:false,serviceChecked:true),"Granted permissions reopened the guide at routine launch")
+        require(!SetupAssistantState.shouldOffer(setupPolicy,newBuild:true,loadingKeychain:false,serviceChecked:true),"Granted permissions reopened setup after an update")
+        setupPolicy.locationGranted = false
+        require(SetupAssistantState.shouldOffer(setupPolicy,newBuild:false,loadingKeychain:false,serviceChecked:true),"Revoked permission failed to reopen the guide")
+        for stage in SetupStage.allCases {
+            var state = SetupReadiness(); state.keychainReady = true; state.profileReady = true; state.locationGranted = true; state.serviceReady = true; state.notifications = .allowed
+            switch stage {
+            case .keychain: state.keychainReady = false
+            case .profile: state.profileReady = false
+            case .location: state.locationGranted = false
+            case .service: state.serviceReady = false
+            case .notifications: state.notifications = .denied
+            case .ready: break
+            }
+            let panel = NSWindow(contentRect:NSRect(x:0,y:0,width:580,height:620),styleMask:[.titled,.closable],backing:.buffered,defer:false)
+            panel.isReleasedWhenClosed = false
+            panel.contentView = SetupAssistantView.make(state,loading:false,version:"1.0.4",action:{ _ in })
+            panel.contentView?.layoutSubtreeIfNeeded()
+            require(!buttons(panel.contentView!).isEmpty,"Setup stage has no recovery action")
+            for button in buttons(panel.contentView!) {
+                let frame = button.convert(button.bounds,to:panel.contentView)
+                require(frame.minY >= -1 && frame.maxY <= panel.contentView!.bounds.height+1 && frame.maxX <= 581,"Setup action clipped at stage \(stage.rawValue)")
+            }
+            if stage == .notifications { require(buttons(panel.contentView!).contains { $0.title == "Продолжить без уведомлений" },"Optional notification skip missing") }
+            if let directory = ProcessInfo.processInfo.environment["AT_SETUP_PREVIEW_DIRECTORY"], let view = panel.contentView,
+               let bitmap = view.bitmapImageRepForCachingDisplay(in:view.bounds) {
+                view.cacheDisplay(in:view.bounds,to:bitmap)
+                if let data = bitmap.representation(using:.png,properties:[:]) {
+                    let folder = URL(fileURLWithPath:directory); try? FileManager.default.createDirectory(at:folder,withIntermediateDirectories:true)
+                    try? data.write(to:folder.appendingPathComponent(stage.rawValue + ".png"))
+                }
+            }
+            panel.close()
+        }
+        for checking in [true,false] {
+            var state = SetupReadiness(); state.keychainReady = true; state.profileReady = true; state.locationGranted = true; state.notifications = .allowed
+            state.serviceChecked = !checking; state.serviceInstalling = !checking
+            let view = SetupAssistantView.make(state,loading:false,version:"1.0.4",action:{_ in})
+            require(!buttons(view).contains { $0.title.contains("Установить") },"Unfinished service check or installation offered duplicate installation")
+        }
         let sample = Profile(name:"Резервный профиль с длинным названием",addresses:["10.0.0.2/32"],dns:["1.1.1.1"],mtu:1280,interface:[:],peer:[:],endpointHost:"198.51.100.10",endpointPort:51820,resolvedIP:"198.51.100.10")
         for profiles in [[],[sample,sample,sample]] {
             settings.profiles = profiles
@@ -1111,6 +1311,20 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
         pasteboard.writeObjects([URL(fileURLWithPath:"/tmp/test.conf") as NSURL,URL(fileURLWithPath:"/tmp/unrelated.txt") as NSURL])
         let surface = window.contentView as! ConsoleSurface
         require(surface.files(pasteboard).map { $0.lastPathComponent } == ["test.conf"],"file drop filtering")
+        let previousDrop = surface.dropped
+        surface.dropped = { [weak self] in self?.profileImports.enqueue($0) ?? false }
+        busy = true
+        require(surface.receive(pasteboard) && profileImports.count == 1,"Busy connection discarded a profile drop")
+        require(profileImports.takeIfIdle(!busy) == nil,"Busy drop queue drained prematurely")
+        busy = false
+        require(profileImports.takeIfIdle(!busy)?.urls.first?.lastPathComponent == "test.conf","Dropped file was not retained until import could start")
+        surface.dropped = nil
+        require(!surface.receive(pasteboard),"Drop was reported successful without an import handler")
+        surface.dropped = previousDrop
+        let legacyDrop = NSPasteboard.withUniqueName(); defer { legacyDrop.releaseGlobally() }
+        legacyDrop.declareTypes([ProfileDropView.legacyFiles],owner:nil)
+        legacyDrop.setPropertyList(["/tmp/legacy.CONF"],forType:ProfileDropView.legacyFiles)
+        require(surface.files(legacyDrop).map(\.lastPathComponent) == ["legacy.CONF"],"Legacy Finder file drop was ignored")
         settings.profiles = []; status.phase = .home; status.message = "Домашняя сеть · через роутер"
         togglePopover(); require(popover.isShown,"popover did not open")
         let previousView = popover.contentViewController!.view
@@ -1143,6 +1357,41 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
         require(buttons(body).contains { $0.title == "Восстановить обычный интернет" },"locked Keychain lost emergency recovery")
         do { try saveSettings(); require(false,"locked Keychain allowed overwriting unread settings") } catch {}
         settingsReadError = nil; buildPage()
+        // Exercise auditSetup -> production automatic driver in the native
+        // application. Only OS permission/installation side effects are replaced.
+        for mode in Mode.allCases {
+            settings.mode = mode; busy = false; setup.automation = SetupAutomation()
+            var readiness = SetupReadiness(); readiness.keychainReady = true; readiness.profileReady = true; readiness.locationGranted = true; readiness.notifications = .allowed
+            setupTestReadiness = readiness
+            var calls: [SetupAutomaticAction] = []
+            setupTestActionRunner = { action in calls.append(action); self.busy = true }
+            auditSetup()
+            require(calls == [.service],"Startup waited for Add Service button in \(mode)")
+            for _ in 0..<100 { auditSetup(); advanceAutomaticSetup() }
+            require(calls == [.service],"In-flight installer started twice")
+            readiness.serviceReady = true; setupTestReadiness = readiness; busy = false
+            auditSetup()
+            require(calls == [.service] && settings.mode == mode,"Installer completion repeated a prompt or changed Off/Auto/On")
+        }
+        settings.mode = .off; busy = false; setup.automation = SetupAutomation()
+        var chain = SetupReadiness(); chain.keychainReady = true; chain.profileReady = true; chain.notifications = .notRequested
+        setupTestReadiness = chain; setupTestCanRequestLocation = true
+        var chainCalls: [SetupAutomaticAction] = []
+        setupTestActionRunner = { action in chainCalls.append(action); if action == .service { self.busy = true } }
+        auditSetup(); auditSetup()
+        require(chainCalls == [.location],"Fresh setup did not begin with one native location request")
+        chain.locationGranted = true; setupTestReadiness = chain; auditSetup()
+        require(chainCalls == [.location,.service],"Location grant did not automatically advance to service installation")
+        chain.serviceReady = true; setupTestReadiness = chain; busy = false; auditSetup()
+        require(chainCalls == [.location,.service,.notifications],"Ready service did not automatically advance to notifications")
+        chain.notifications = .allowed; setupTestReadiness = chain
+        for _ in 0..<100 { auditSetup() }
+        require(chainCalls.count == 3 && settings.mode == .off,"Completed startup reopened prompts or enabled VPN from Off")
+        setup.automation = SetupAutomation()
+        setupTestActionRunner = { _ in require(false,"Already-granted startup prompted unnecessarily") }
+        auditSetup()
+        setupTestReadiness = nil; setupTestActionRunner = nil; setupTestCanRequestLocation = false; setup.automation = SetupAutomation(); busy = false
+        print("Native startup workflow passed: Off/Auto/On, old or missing service, delayed installer, automatic permission chain and already-granted skip. OS side effects replaced; no installed-service changes.")
         let start = CFAbsoluteTimeGetCurrent()
         for _ in 0..<1000 { updateStatus() }
         let milliseconds = (CFAbsoluteTimeGetCurrent()-start)*1000/1000
@@ -1177,11 +1426,23 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
         NSApp.terminate(nil)
     }
 }
+// Explicit local route export for upgrade preservation checks; never prints or
+// exports VPN profiles, keys, SSIDs, or the rest of the Keychain record.
+if let index = CommandLine.arguments.firstIndex(of:"--export-routes"), index+1 < CommandLine.arguments.count {
+    do {
+        let settings = try Storage.load(useIndependentRouting:false)
+        let file = URL(fileURLWithPath:CommandLine.arguments[index+1])
+        try JSONEncoder().encode(RoutingExport(routing:settings.routing)).write(to:file,options:.atomic)
+        guard chmod(file.path,0o600) == 0 else { throw AppError.message("Не удалось защитить экспорт маршрутов") }
+        print("Exported \(settings.routing.rules.count) routing rules; no VPN profiles or keys exported")
+        exit(0)
+    } catch { fputs((error.localizedDescription + "\n"),stderr); exit(1) }
+}
 // Read-only diagnostics: parse the supplied file without Keychain, UI or tunnel changes.
 if CommandLine.arguments.contains("--settings-fingerprint") {
     do {
         let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
-        let data = try encoder.encode(Storage.load())
+        let data = try encoder.encode(Storage.load(useIndependentRouting:false))
         print(SHA256.hash(data:data).map { String(format:"%02x",$0) }.joined()); exit(0)
     } catch { fputs("Settings preservation check failed; no profile data printed\n",stderr); exit(1) }
 }

@@ -12,6 +12,44 @@ func rejects(_ action: () throws -> Void) -> Bool {
 let key = Data(repeating: 7, count: 32).base64EncodedString()
 let config = "[Interface]\nPrivateKey=\(key)\nAddress=10.0.0.2/32\nDNS=1.1.1.1\n[Peer]\nPublicKey=\(key)\nEndpoint=198.51.100.10:51820\nAllowedIPs=0.0.0.0/0\n"
 let profile = try Profile.parse(config, name: "Audit")
+// The router need not provide DNS (e.g. tethering with separate DHCP DNS).
+// Global/DNS includes supplemental VPN resolvers and must never feed the core.
+var networkValues: [String:[String:Any]] = [
+    "State:/Network/Global/IPv4":["PrimaryService":"wifi","PrimaryInterface":"en0"],
+    "State:/Network/Service/wifi/IPv4":["InterfaceName":"en0","Router":"192.0.2.1"],
+    "State:/Network/Service/wifi/DNS":["ServerAddresses":["192.0.2.53","192.0.2.54"]],
+    "State:/Network/Global/DNS":["ServerAddresses":["172.29.255.2"]]
+]
+func testPhysical() -> PhysicalNetwork { PhysicalNetwork.read { networkValues[$0] } }
+check(testPhysical().dnsServers == ["192.0.2.53","192.0.2.54"],"Physical DNS comes from DHCP, not gateway or our global resolver")
+networkValues["Setup:/Network/Service/wifi/DNS"] = ["ServerAddresses":["192.0.2.99"]]
+check(testPhysical().dnsServers == ["192.0.2.99"],"Manual DNS overrides DHCP DNS")
+networkValues["Setup:/Network/Service/wifi/DNS"] = ["ServerAddresses":[]]
+check(testPhysical().dnsServers == ["192.0.2.53","192.0.2.54"],"Empty manual DNS preserves DHCP DNS")
+networkValues["State:/Network/Service/wifi/DNS"] = ["ServerAddresses":["2001:db8::53","192.0.2.53","invalid"]]
+check(testPhysical().dnsServers == ["192.0.2.53","2001:db8::53"],"Invalid DNS is excluded and IPv4 DNS is preferred")
+networkValues["State:/Network/Service/wifi/DNS"] = nil
+check(testPhysical().dnsServers.isEmpty,"Missing DNS fabricated a resolver from the gateway or Global/DNS")
+networkValues["State:/Network/Global/IPv4"] = ["PrimaryService":"other","PrimaryInterface":"en1"]
+networkValues["State:/Network/Service/other/IPv4"] = ["InterfaceName":"en1","Router":"198.51.100.1"]
+networkValues["State:/Network/Service/other/DNS"] = ["ServerAddresses":["198.51.100.53"]]
+check(testPhysical().dnsServers == ["198.51.100.53"],"Network switch reused the previous service's DNS")
+func endpointDNSReply(_ query:Data,_ bytes:[UInt8]) -> Data {
+    var response = Array(query); response[2] = 0x81; response[3] = 0x80; response[6] = 0; response[7] = 1
+    response += [0xc0,12,0,1,0,1,0,0,0,60,0,4] + bytes
+    return Data(response)
+}
+let resolverNetwork = PhysicalNetwork(interface:"en0",gateway:"192.0.2.1",service:"dns",dnsServers:["192.0.2.53","192.0.2.54"])
+var resolverServers: [String] = []
+let endpointAddress = try EndpointResolver.resolve("vpn.example",physical:resolverNetwork,exchange:{ query,server,iface in
+    resolverServers.append(server)
+    check(iface == "en0","Endpoint DNS did not bind the physical interface")
+    return endpointDNSReply(query,server == "192.0.2.53" ? [198,18,0,197] : [203,0,113,10])
+})
+check(endpointAddress == "203.0.113.10" && resolverServers == ["192.0.2.53","192.0.2.54"],"Endpoint resolver accepted fake IP or queried gateway instead of actual DNS")
+check(rejects { _ = try EndpointResolver.resolve("vpn.example",physical:resolverNetwork,exchange:{ query,_,_ in endpointDNSReply(query,[198,19,0,1]) }) },"Synthetic-only DNS answers escaped endpoint resolution")
+check(rejects { _ = try EndpointResolver.resolve("198.18.0.197",physical:resolverNetwork) },"Literal fake endpoint bypassed DNS validation")
+check(try EndpointResolver.resolve("203.0.113.20",physical:PhysicalNetwork()) == "203.0.113.20","Literal real endpoint unnecessarily required network DNS")
 check(!Profile.isIP("192.0.2.1\0unexpected"), "IP validation rejects embedded NUL before C conversion")
 check(!Profile.validCIDR("192.0.2.1\0unexpected/32"), "CIDR validation rejects embedded NUL")
 check(rejects { _ = try RoutingIPImport.parse("192.0.2.1\0unexpected") }, "IP-list import rejects embedded NUL")
@@ -119,7 +157,7 @@ if let path = ProcessInfo.processInfo.environment["AT_TEST_ROUTING_CORE"] {
         rules.rules = [RoutingRule(name:entry["name"] as! String,serviceID:entry["id"] as? String,sourcePath:entry["sourcePath"] as? String,baseDomains:entry["domains"] as! [String])]
         for ipv6 in [false,true] {
             let config = directory.appendingPathComponent("core-config.json")
-            try RoutingCoreConfiguration.make(rules,physicalInterface:"en0",gateway:"192.168.1.1",tunnel:"utun3",dns:"1.1.1.1",supportsIPv6:ipv6).write(to:config)
+            try RoutingCoreConfiguration.make(rules,physicalInterface:"en0",physicalDNS:"192.168.1.53",tunnel:"utun3",dns:"1.1.1.1",supportsIPv6:ipv6).write(to:config)
             let process = Process(); process.executableURL = URL(fileURLWithPath:path); process.arguments = ["check","-c",config.path]
             process.standardOutput = FileHandle.nullDevice; process.standardError = FileHandle.nullDevice
             try process.run(); process.waitUntilExit()

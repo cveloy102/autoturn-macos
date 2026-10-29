@@ -18,11 +18,15 @@ final class NetworkObserver: NSObject, CLLocationManagerDelegate {
     private var reading = false, readAgain = false
     private var latest = NetworkObservation(available:false,interface:nil,ssid:nil,gateway:nil)
     private var servicesEnabled: Bool?
+    private var accessReadInFlight = false
+    private(set) var locationAccessChecked = false
+    var accessChanged: (() -> Void)?
     var changed: ((NetworkObservation) -> Void)?
     override convenience init() { self.init(sampling:NetworkObserver.readSnapshot,monitoring:true) }
     init(sampling: @escaping () -> NetworkObservation, monitoring: Bool) {
         self.sample = sampling; self.monitoring = monitoring
         super.init()
+        locationAccessChecked = !monitoring
         guard monitoring else { return }
         location.delegate = self
         monitor.pathUpdateHandler = { [weak self] _ in DispatchQueue.main.async { self?.report() } }
@@ -46,28 +50,43 @@ final class NetworkObserver: NSObject, CLLocationManagerDelegate {
     func requestInitialPermission() {
         if location.authorizationStatus == .notDetermined { location.requestAlwaysAuthorization() }
     }
+    var canRequestLocationPermission: Bool { location.authorizationStatus == .notDetermined && servicesEnabled != false }
     var locationPermissionMissing: Bool {
         let status = location.authorizationStatus
         return servicesEnabled == false || (status != .authorizedAlways && status != .authorized)
     }
     func requestPermission() {
-        requestInitialPermission()
+        if canRequestLocationPermission { requestInitialPermission(); return }
         // Re-requesting a denied permission does not show another system prompt.
         if !NSWorkspace.shared.open(Self.locationSettingsURL) {
             NSWorkspace.shared.open(URL(string:"x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension")!)
         }
         report()
     }
-    func locationManager(_ manager: CLLocationManager, didChangeAuthorization status: CLAuthorizationStatus) { report() }
+    func locationManager(_ manager: CLLocationManager, didChangeAuthorization status: CLAuthorizationStatus) { checkLocationAccess(); accessChanged?(); report() }
+    func checkLocationAccess() {
+        guard monitoring, !accessReadInFlight else { return }
+        accessReadInFlight = true
+        // Wi-Fi's native SSID read can be slow. Permission readiness must reach
+        // the setup guide independently, before that read finishes.
+        DispatchQueue.global(qos:.userInitiated).async { [weak self] in
+            let enabled = CLLocationManager.locationServicesEnabled()
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.servicesEnabled = enabled; self.locationAccessChecked = true
+                self.accessReadInFlight = false; self.accessChanged?()
+            }
+        }
+    }
     func report() {
+        checkLocationAccess()
         if reading { readAgain = true; return }
         reading = true
         samplingQueue.async { [weak self] in
             guard let self = self else { return }
-            let enabled = self.monitoring ? CLLocationManager.locationServicesEnabled() : nil
             let observation = self.sample()
             DispatchQueue.main.async {
-                self.reading = false; self.latest = observation; self.servicesEnabled = enabled
+                self.reading = false; self.latest = observation
                 self.changed?(observation)
                 if self.readAgain { self.readAgain = false; self.report() }
             }

@@ -11,11 +11,13 @@ protocol TrafficProtection: AnyObject {
     func configureRouting(_ settings: RoutingSettings, physical: PhysicalNetwork) throws
     func setRoutingInterface(_ interface: String?) throws
     func setDirectAddresses(_ addresses: Set<String>) throws
+    func configureEndpointDNS(_ servers: [String], physical: PhysicalNetwork) throws
 }
 extension TrafficProtection {
     func setRoutingInterface(_ interface: String?) throws {}
     func configureRouting(_ settings: RoutingSettings, physical: PhysicalNetwork) throws {}
     func setDirectAddresses(_ addresses: Set<String>) throws {}
+    func configureEndpointDNS(_ servers: [String], physical: PhysicalNetwork) throws {}
 }
 protocol ManagedTunnel: AnyObject {
     var running: Bool { get }
@@ -94,17 +96,53 @@ struct PhysicalNetwork {
     var gateway: String?
     var service: String?
     var gateway6: String?
+    var dnsServers: [String] = []
     var available: Bool { interface != nil && gateway != nil }
     static func read() -> PhysicalNetwork {
-        guard let store = SCDynamicStoreCreate(nil, "AutoTurn" as CFString, nil, nil), let global = SCDynamicStoreCopyValue(store, "State:/Network/Global/IPv4" as CFString) as? [String: Any], let service = global["PrimaryService"] as? String, let values = SCDynamicStoreCopyValue(store, "State:/Network/Service/\(service)/IPv4" as CFString) as? [String: Any] else { return PhysicalNetwork() }
+        guard let store = SCDynamicStoreCreate(nil, "AutoTurn" as CFString, nil, nil) else { return PhysicalNetwork() }
+        return read { SCDynamicStoreCopyValue(store, $0 as CFString) as? [String:Any] }
+    }
+    static func read(valuesForKey: (String) -> [String:Any]?) -> PhysicalNetwork {
+        guard let global = valuesForKey("State:/Network/Global/IPv4"), let service = global["PrimaryService"] as? String,
+              let values = valuesForKey("State:/Network/Service/\(service)/IPv4") else { return PhysicalNetwork() }
         let iface = (values["InterfaceName"] as? String) ?? (global["PrimaryInterface"] as? String)
         guard let interface = iface, interface.range(of: "^(en|bridge|eth)[0-9]+$", options: .regularExpression) != nil else { return PhysicalNetwork() }
         let router = values["Router"] as? String
         guard let gateway = router, Profile.isIP(gateway) else { return PhysicalNetwork(interface: interface, gateway: nil, service: service) }
-        let v6 = SCDynamicStoreCopyValue(store, "State:/Network/Service/\(service)/IPv6" as CFString) as? [String:Any]
+        let v6 = valuesForKey("State:/Network/Service/\(service)/IPv6")
         var gateway6 = v6?["Router"] as? String
         if let g = gateway6, Profile.isIP(g) { if g.lowercased().hasPrefix("fe80:") { gateway6 = g + "%" + interface } } else { gateway6 = nil }
-        return PhysicalNetwork(interface: interface, gateway: gateway, service: service,gateway6:gateway6)
+        // Read the physical service, never Global/DNS: the latter can point back
+        // to our own synthetic resolver. Manual DNS overrides DHCP DNS.
+        let manualDNS = valuesForKey("Setup:/Network/Service/\(service)/DNS")?["ServerAddresses"] as? [String] ?? []
+        let networkDNS = valuesForKey("State:/Network/Service/\(service)/DNS")?["ServerAddresses"] as? [String] ?? []
+        let addresses = (manualDNS.isEmpty ? networkDNS : manualDNS).filter { Profile.isIP($0) }
+        // This client requires an IPv4 uplink; prefer its IPv4 resolver, while
+        // retaining an IPv6 resolver for networks that only supply one.
+        let dns = addresses.filter { !$0.contains(":") } + addresses.filter { $0.contains(":") }
+        return PhysicalNetwork(interface: interface, gateway: gateway, service: service,gateway6:gateway6,dnsServers:dns)
+    }
+}
+
+enum EndpointResolver {
+    static func resolve(_ host: String, physical: PhysicalNetwork, exchange: (Data,String,String) throws -> Data = { try RoutingDNSProxy.exchange($0,upstream:$1,interface:$2,tcp:false) }) throws -> String {
+        guard Profile.validEndpointHost(host) else { throw AppError.message("Некорректный адрес VPN-сервера") }
+        if Profile.isIP(host) {
+            guard !host.contains(":"), !Profile.isRoutingFakeIP(host) else { throw AppError.message("VPN-серверу нужен настоящий IPv4 адрес, вне служебной сети AutoTurn") }
+            return host
+        }
+        guard let interface = physical.interface else { throw AppError.message("Нет физической сети для определения VPN-сервера") }
+        let name = host.hasSuffix(".") ? String(host.dropLast()) : host
+        var query = Data([0x43,0x23,1,0,0,1,0,0,0,0,0,0])
+        for label in name.split(separator:".") { query.append(UInt8(label.utf8.count)); query.append(contentsOf:label.utf8) }
+        query.append(contentsOf:[0,0,1,0,1])
+        for server in physical.dnsServers.filter({ Profile.isIP($0) && !$0.contains(":") && !Profile.isRoutingFakeIP($0) }).prefix(3) {
+            guard let response = try? exchange(query,server,interface),
+                  let records = try? DNSPacket(response).answers(matching:query),
+                  let address = records.compactMap({ $0.ip }).first(where: { !$0.contains(":") && !Profile.isRoutingFakeIP($0) }) else { continue }
+            return address
+        }
+        throw AppError.message("Не удалось определить настоящий IPv4 адрес VPN-сервера через DNS текущей сети")
     }
 }
 
@@ -116,6 +154,13 @@ final class TrafficGuard: TrafficProtection {
     private let lock = NSRecursiveLock()
     private var routing = RoutingSettings(), physical = PhysicalNetwork()
     private var coreInterface: String?
+    private var endpointDNS: [String] = [], endpointDNSInterface: String?
+    func configureEndpointDNS(_ servers: [String], physical: PhysicalNetwork) throws {
+        lock.lock(); defer { lock.unlock() }
+        guard servers.allSatisfy({ Profile.isIP($0) && !$0.contains(":") && !Profile.isRoutingFakeIP($0) }),
+              servers.isEmpty || physical.interface?.range(of:"^(en|bridge|eth)[0-9]+$",options:.regularExpression) != nil else { throw AppError.message("Некорректный DNS VPN-сервера") }
+        endpointDNS = servers; endpointDNSInterface = servers.isEmpty ? nil : physical.interface
+    }
     func configureRouting(_ settings: RoutingSettings, physical: PhysicalNetwork) throws { lock.lock(); defer { lock.unlock() }; routing = settings; self.physical = physical }
     func setRoutingInterface(_ interface: String?) throws {
         lock.lock(); defer { lock.unlock() }
@@ -133,7 +178,13 @@ final class TrafficGuard: TrafficProtection {
         var rules = "pass out quick on lo0 all\n"
         if routing.mode == .rules, let core = coreInterface { rules += "pass out quick on \(core) all\n" }
         if let tunnel = tunnel { rules += "pass out quick on \(tunnel) all\n" }
-        if let profile = profile, let ip = profile.resolvedIP, Profile.isIP(ip) { rules += "pass out quick \(ip.contains(":") ? "inet6" : "inet") proto udp to \(ip) port \(profile.endpointPort) keep state\n" }
+        if let profile = profile, let ip = profile.resolvedIP {
+            guard Profile.isIP(ip), !Profile.isRoutingFakeIP(ip) else { throw AppError.message("VPN-сервер подменён служебным адресом AutoTurn") }
+            rules += "pass out quick \(ip.contains(":") ? "inet6" : "inet") proto udp to \(ip) port \(profile.endpointPort) keep state\n"
+        }
+        if let interface = endpointDNSInterface {
+            for server in endpointDNS { rules += "pass out quick on \(interface) inet proto { tcp udp } to \(server) port 53 user root keep state\n" }
+        }
         if routing.mode == .rules, coreInterface != nil, let iface = physical.interface {
             // All ordinary app flows enter the routing TUN. Only the root-owned
             // core can open physical outbound sockets; it has no proxy listener.
@@ -205,7 +256,7 @@ final class Tunnel: ManagedTunnel {
     }
     var running: Bool { process?.isRunning == true }
     func start(_ profile: Profile, physical: PhysicalNetwork, engine: String) throws {
-        guard let ip = profile.resolvedIP, Profile.isIP(ip), let gateway = physical.gateway, let primaryService = physical.service else { throw AppError.message("Нет физического маршрута или IP сервера") }
+        guard let ip = profile.resolvedIP, Profile.isIP(ip), !Profile.isRoutingFakeIP(ip), let gateway = physical.gateway, let primaryService = physical.service else { throw AppError.message("Нет физического маршрута или настоящего IP сервера") }
         // IPv6-only physical uplinks will be supported after on-device validation.
         guard !ip.contains(":") else { throw AppError.message("В первой сборке нужен IPv4 Endpoint; IPv6 трафик в туннеле поддерживается") }
         _ = try SystemCommand.checked("/sbin/route", ["-n", "add", "-host", ip, gateway])
@@ -295,19 +346,47 @@ final class Tunnel: ManagedTunnel {
 }
 
 enum HealthProbe {
-    static func check(tunnel: String, dns: [String]? = nil) -> Bool {
-        // Curl is bound to this utun; physical egress is independently blocked by PF.
-        let endpoints = ["https://www.apple.com/library/test/success.html", "https://www.cloudflare.com/cdn-cgi/trace"]
-        for endpoint in endpoints {
-            var extra: [String] = []
-            if let dns = dns, let server = dns.first(where: { !$0.contains(":") }), let host = URL(string:endpoint)?.host {
-                let labels = host.split(separator:".")
-                var query = Data([0x43,0x21,1,0,0,1,0,0,0,0,0,0]); for l in labels { query.append(UInt8(l.utf8.count)); query.append(contentsOf:l.utf8) }; query.append(contentsOf:[0,0,1,0,1])
-                guard let response = try? RoutingDNSProxy.exchange(query,upstream:server,interface:tunnel,tcp:false), let records = try? DNSPacket(response).answers(matching:query), let ip = records.compactMap({$0.ip}).first(where: { !$0.contains(":") }) else { continue }
-                extra = ["--resolve","\(host):443:\(ip)"]
-            }
-            if let result = try? SystemCommand.run("/usr/bin/curl", ["--silent", "--fail", "--noproxy", "*", "--interface", tunnel, "--connect-timeout", "3", "--max-time", "5", "--max-filesize", "8192"] + extra + [endpoint]), result.code == 0, !result.output.isEmpty { return true }
+    // The first successful HTTPS response is enough. A slow/blocked test site
+    // must not hold a healthy VPN behind its timeout before trying the other.
+    static func firstSuccess(_ probes: [() -> Bool], timeout: TimeInterval = 10) -> Bool {
+        final class State {
+            let condition = NSCondition()
+            var remaining: Int
+            var healthy = false
+            init(_ count: Int) { remaining = count }
         }
+        let state = State(probes.count)
+        for probe in probes {
+            DispatchQueue.global(qos:.utility).async {
+                let result = probe()
+                state.condition.lock()
+                state.healthy = state.healthy || result; state.remaining -= 1
+                state.condition.broadcast(); state.condition.unlock()
+            }
+        }
+        let deadline = Date().addingTimeInterval(timeout)
+        state.condition.lock(); defer { state.condition.unlock() }
+        while !state.healthy && state.remaining > 0 {
+            if !state.condition.wait(until:deadline) { break }
+        }
+        return state.healthy
+    }
+    static func check(tunnel: String, dns: [String]? = nil) -> Bool {
+        // Curl stays bound to this utun; physical egress is blocked by PF.
+        let endpoints = ["https://www.apple.com/library/test/success.html", "https://www.cloudflare.com/cdn-cgi/trace"]
+        return firstSuccess(endpoints.map { endpoint in { checkEndpoint(endpoint,tunnel:tunnel,dns:dns) } })
+    }
+    private static func checkEndpoint(_ endpoint: String, tunnel: String, dns: [String]?) -> Bool {
+        var extra: [String] = []
+        if let dns = dns, let server = dns.first(where: { !$0.contains(":") }), let host = URL(string:endpoint)?.host {
+            let labels = host.split(separator:".")
+            var query = Data([0x43,0x21,1,0,0,1,0,0,0,0,0,0]); for l in labels { query.append(UInt8(l.utf8.count)); query.append(contentsOf:l.utf8) }; query.append(contentsOf:[0,0,1,0,1])
+            guard let response = try? RoutingDNSProxy.exchange(query,upstream:server,interface:tunnel,tcp:false),
+                  let records = try? DNSPacket(response).answers(matching:query),
+                  let ip = records.compactMap({$0.ip}).first(where: { !$0.contains(":") && !Profile.isRoutingFakeIP($0) }) else { return false }
+            extra = ["--resolve","\(host):443:\(ip)"]
+        }
+        if let result = try? SystemCommand.run("/usr/bin/curl", ["--silent", "--fail", "--noproxy", "*", "--interface", tunnel, "--connect-timeout", "3", "--max-time", "5", "--max-filesize", "8192"] + extra + [endpoint],timeout:6), result.code == 0, !result.output.isEmpty { return true }
         return false
     }
 }

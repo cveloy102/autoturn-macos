@@ -25,3 +25,5 @@ sh -n "$ROOT/Resources/install-service.sh"
 
 "$SWIFTC" -sdk "$SDK" "$ROOT"/Sources/Shared/*.swift "$ROOT/Sources/App/NetworkObserver.swift" "$ROOT/TestsNetwork/main.swift" -framework AppKit -framework CoreWLAN -framework CoreLocation -framework Network -framework SystemConfiguration -o "$ROOT/.build/network-tests"
 "$ROOT/.build/network-tests"
+
+"$SWIFTC" -sdk "$SDK" "$ROOT"/Sources/Shared/*.swift "$ROOT/TestsRoutingDNS/main.swift" -o "$ROOT/.build/routing-dns-fixture"

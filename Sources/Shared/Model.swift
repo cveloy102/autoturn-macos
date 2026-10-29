@@ -72,6 +72,7 @@ struct Profile: Codable, Equatable {
         } else {
             guard !host.contains(":"), validEndpointHost(host) else { throw AppError.message("Некорректный адрес сервера") }
         }
+        guard !Profile.isRoutingFakeIP(host) else { throw AppError.message("Endpoint использует служебную сеть AutoTurn вместо адреса VPN-сервера") }
         let allowed = list(peer.removeValue(forKey: "allowedips") ?? "")
         guard !allowed.isEmpty, allowed.allSatisfy(validCIDR) else { throw AppError.message("Некорректный AllowedIPs") }
         // V1 deliberately routes all traffic; IPv6 is blocked when no IPv6 tunnel address exists.
@@ -110,7 +111,7 @@ struct Profile: Codable, Equatable {
         return copy
     }
     func uapi(ip: String) throws -> String {
-        guard Profile.isIP(ip) else { throw AppError.message("Сервер ещё не разрешён в IP") }
+        guard Profile.isIP(ip), !Profile.isRoutingFakeIP(ip) else { throw AppError.message("Вместо адреса VPN-сервера получен служебный адрес маршрутизатора AutoTurn") }
         let mapping = ["privatekey":"private_key", "listenport":"listen_port", "headerprotectionkey":"header_protection_key", "contentpaddingaddition":"content_padding_addition", "rekeyaftertime":"rekey_after_time", "rekeytimeout":"rekey_timeout", "rejectaftertime":"reject_after_time", "keepalivetimeout":"keepalive_timeout", "maxhandshakeattempts":"max_handshake_attempts", "randomtrailers":"random_trailers", "disablecookies":"disable_cookies"]
         var lines = ["set=1"]
         for key in interface.keys.sorted() {
@@ -129,6 +130,17 @@ struct Profile: Codable, Equatable {
         guard !text.utf8.contains(0) else { return false }
         var a = in_addr(), b = in6_addr()
         return text.withCString { inet_pton(AF_INET, $0, &a) == 1 || inet_pton(AF_INET6, $0, &b) == 1 }
+    }
+    static func isRoutingFakeIP(_ text: String) -> Bool {
+        guard isIP(text) else { return false }
+        var address = in_addr()
+        if text.withCString({ inet_pton(AF_INET,$0,&address) }) == 1 {
+            let number = UInt32(bigEndian:address.s_addr)
+            return number & 0xfffe0000 == 0xc6120000 // 198.18.0.0/15
+        }
+        var address6 = in6_addr()
+        guard text.withCString({ inet_pton(AF_INET6,$0,&address6) }) == 1 else { return false }
+        return withUnsafeBytes(of:&address6) { $0[0] == 0xfc && $0[1] == 0 && ($0[2] & 0xc0) == 0 } // fc00::/18
     }
     static func validEndpointHost(_ text: String) -> Bool {
         if isIP(text) { return true }
@@ -150,16 +162,23 @@ struct Settings: Codable {
     var homeSSIDs: [String] = []
     var profiles: [Profile] = []
     var selectedID: String?
+    var primaryID: String?
     var launchAtLogin: Bool = false
     var routing = RoutingSettings()
     init() {}
-    enum CodingKeys: String, CodingKey { case mode, homeSSIDs, profiles, selectedID, launchAtLogin, routing }
+    var primaryProfileID: String? { profiles.first(where:{ $0.id == primaryID })?.id ?? profiles.first(where:{ $0.id == selectedID })?.id ?? profiles.first?.id }
+    var connectionOrder: [Profile] {
+        guard let primary = profiles.first(where:{ $0.id == primaryProfileID }) else { return profiles }
+        return [primary] + profiles.filter { $0.id != primary.id }
+    }
+    enum CodingKeys: String, CodingKey { case mode, homeSSIDs, profiles, selectedID, primaryID, launchAtLogin, routing }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy:CodingKeys.self)
         mode = try c.decodeIfPresent(Mode.self,forKey:.mode) ?? .auto
         homeSSIDs = try c.decodeIfPresent([String].self,forKey:.homeSSIDs) ?? []
         profiles = try c.decodeIfPresent([Profile].self,forKey:.profiles) ?? []
         selectedID = try c.decodeIfPresent(String.self,forKey:.selectedID)
+        primaryID = try c.decodeIfPresent(String.self,forKey:.primaryID) ?? selectedID ?? profiles.first?.id
         launchAtLogin = try c.decodeIfPresent(Bool.self,forKey:.launchAtLogin) ?? false
         routing = try c.decodeIfPresent(RoutingSettings.self,forKey:.routing) ?? RoutingSettings()
     }

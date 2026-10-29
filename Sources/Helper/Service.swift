@@ -12,6 +12,9 @@ final class Service {
     let tunnel: ManagedTunnel
     let domainRoutes: DomainRouting
     let physicalRead: () -> PhysicalNetwork
+    let resolveEndpoint: (String, PhysicalNetwork) throws -> String
+    private var tunnelEndpoint: (id:String, host:String, ip:String)?
+    private var endpointCache: [String:(ip:String,expires:TimeInterval)] = [:]
     let healthCheck: ((String) -> Bool)?
     let asyncHealth: ((String, [String]?, @escaping (Bool) -> Void) -> Void)?
     private var healthProbeToken: UUID?
@@ -40,7 +43,8 @@ final class Service {
     let installation: Installation
     let timer: DispatchSourceTimer
     let monitor = NWPathMonitor()
-    init(_ installation: Installation, protection: TrafficProtection = TrafficGuard(), managedTunnel: ManagedTunnel = Tunnel(), routing: DomainRouting? = nil, physical: @escaping () -> PhysicalNetwork = PhysicalNetwork.read, health: ((String) -> Bool)? = nil, asyncHealth: ((String, [String]?, @escaping (Bool) -> Void) -> Void)? = nil, stateDirectory: String = support, monitoring: Bool = true, now: @escaping () -> Date = Date.init, continuousNow: @escaping () -> TimeInterval = ContinuousTime.now, recoverProcesses: @escaping () throws -> Void = OwnedProcessRecovery.stop) {
+    init(_ installation: Installation, protection: TrafficProtection = TrafficGuard(), managedTunnel: ManagedTunnel = Tunnel(), routing: DomainRouting? = nil, physical: @escaping () -> PhysicalNetwork = PhysicalNetwork.read, health: ((String) -> Bool)? = nil, asyncHealth: ((String, [String]?, @escaping (Bool) -> Void) -> Void)? = nil, stateDirectory: String = support, monitoring: Bool = true, now: @escaping () -> Date = Date.init, continuousNow: @escaping () -> TimeInterval = ContinuousTime.now, recoverProcesses: @escaping () throws -> Void = OwnedProcessRecovery.stop, resolveEndpoint: @escaping (String, PhysicalNetwork) throws -> String = { try EndpointResolver.resolve($0,physical:$1) }) {
+        self.resolveEndpoint = resolveEndpoint
         self.now = now; self.continuousNow = continuousNow; self.asyncHealth = asyncHealth
         self.recoverProcesses = recoverProcesses
         self.installation = installation; domainRoutes = routing ?? RoutingCoreManager(protection:protection,directory:stateDirectory); guardManager = protection; tunnel = managedTunnel; physicalRead = physical; healthCheck = health; self.stateDirectory = stateDirectory
@@ -117,20 +121,35 @@ final class Service {
                 value.routing = try value.routing.validated()
                 guard (try JSONEncoder().encode(value)).count < 900000 else { throw AppError.message("Настройки слишком большие") }
                 value.profiles = try value.profiles.map { try $0.validated() }
+                value.primaryID = value.primaryProfileID
+                value.profiles = value.connectionOrder
                 guard Set(value.profiles.map { $0.id }).count == value.profiles.count else { throw AppError.message("Повторные профили") }
                 if value.mode != .off && value.profiles.isEmpty { throw AppError.message("Сначала импортируй профиль") }
                 let changed = value.profiles != settings.profiles || value.selectedID != settings.selectedID || value.routing.mode != settings.routing.mode || (value.routing.mode == .rules && value.routing.rules != settings.routing.rules)
-                cancelHealthProbe()
+                let modeChanged = value.mode != settings.mode
+                let freshCycle = settings.mode == .off || [.home,.off,.setup].contains(status.phase)
+                let manualSelection = value.selectedID != settings.selectedID && !freshCycle
+                if changed || modeChanged || freshCycle { cancelHealthProbe() }
                 settings = value
                 if let network = request.network { recordNetwork(network) }
-                if changed { index = value.profiles.firstIndex { $0.id == value.selectedID } ?? 0; pendingTunnelReset = true }
-                failures = 0; attempted = 0; round = 0; nextCheck = .distantPast
+                if changed || freshCycle { index = manualSelection ? (value.profiles.firstIndex { $0.id == value.selectedID } ?? 0) : 0 }
+                if changed { pendingTunnelReset = true }
+                if changed || modeChanged || freshCycle {
+                    failures = 0; attempted = 0; round = 0; nextCheck = .distantPast
+                }
                 event("Настройки применены"); tick()
             case "network":
                 guard let value = request.network else { throw AppError.message("Нет состояния сети") }
                 let changed = (value.ssid != nil && value.ssid != confirmedNetwork?.ssid) || value.interface != observation.interface || value.gateway != observation.gateway || value.available != observation.available
                 if recordNetwork(value) && changed { nextCheck = .distantPast }; tick()
-            case "check": nextCheck = .distantPast; tick()
+            case "check":
+                // A manual check starts/joins a probe. Its immediate RPC reply
+                // must not reuse a success from an already completed probe.
+                status.verifiedAt = nil
+                if status.phase == .connected {
+                    status.phase = .connecting; status.message = "Проверяем доступ через VPN"
+                }
+                nextCheck = .distantPast; tick()
             case "next":
                 guard settings.profiles.count > 1 else { throw AppError.message("Нет резервного профиля") }
                 if settings.mode != .off { try stopProtectedTunnel(physical: physicalRead()) }
@@ -176,9 +195,15 @@ final class Service {
         }
         previousWallTime = wallTime
         let physical = physicalRead()
+        if physical.dnsServers != observedPhysical.dnsServers || physical.service != observedPhysical.service {
+            endpointCache.removeAll()
+            cancelHealthProbe(); status.verifiedAt = nil; nextCheck = .distantPast
+        }
         let changed = physical.interface != observedPhysical.interface || physical.gateway != observedPhysical.gateway
         if changed {
+            endpointCache.removeAll()
             cancelHealthProbe()
+            index = 0; failures = 0; attempted = 0; round = 0
             if observation.interface != physical.interface || observation.gateway != physical.gateway { observedAt = .distantPast; observedContinuousAt = -Double.infinity }
             if confirmedNetwork?.interface != physical.interface || confirmedNetwork?.gateway != physical.gateway { confirmedNetwork = nil; confirmedAt = .distantPast; confirmedContinuousAt = -Double.infinity }
             nextCheck = .distantPast
@@ -197,15 +222,18 @@ final class Service {
         status.mode = settings.mode
         let wanted = settings.mode == .off ? false : settings.profiles.isEmpty ? guardRequired : Policy.wantsVPN(mode: settings.mode, network: network, homes: settings.homeSSIDs)
         defer {
-            let decision = "mode=\(settings.mode.rawValue) phase=\(status.phase.rawValue) guard=\(guardManager.active) available=\(network.available) ssidKnown=\(network.ssid != nil) home=\(network.ssid.map { settings.homeSSIDs.contains($0) } ?? false) interface=\(physical.interface ?? "none")"
+            let decision = "mode=\(settings.mode.rawValue) phase=\(status.phase.rawValue) guard=\(guardManager.active) available=\(network.available) ssidKnown=\(network.ssid != nil) home=\(network.ssid.map { settings.homeSSIDs.contains($0) } ?? false) interface=\(physical.interface ?? "none") routing=\(settings.routing.mode.rawValue) physicalDNSKnown=\(!physical.dnsServers.isEmpty) dnsMatchesGateway=\(physical.dnsServers.first != nil && physical.dnsServers.first == physical.gateway)"
             if decision != lastDecision {
                 lastDecision = decision
                 let age = Int(max(0,min(86400,now().timeIntervalSince(observedAt))))
                 event(decision + " observationAge=\(age)s")
             }
         }
+        var activeProfile: Profile?
         do {
             if !wanted {
+                endpointCache.removeAll()
+                index = 0
                 cancelHealthProbe()
                 pendingTunnelReset = false; retryTunnelAfterBackoff = false
                 failures = 0; attempted = 0; round = 0; nextCheck = .distantPast
@@ -238,6 +266,7 @@ final class Service {
                 status.message = "Проверяем домашнюю сеть после сна. Защита включена."
                 return
             }
+            if retryTunnelAfterBackoff && now() >= nextCheck { index = 0 }
             if ((changed || pendingTunnelReset || (retryTunnelAfterBackoff && now() >= nextCheck)) && tunnel.running) || (!tunnel.running && tunnel.interface != nil) {
                 try stopProtectedTunnel(physical: physical)
                 retryTunnelAfterBackoff = false
@@ -250,7 +279,26 @@ final class Service {
                 try guardManager.apply(tunnel: tunnel.running ? tunnel.interface : nil, profile: nil); saveGuard()
                 status.phase = .waiting; status.message = settings.profiles.isEmpty ? "Ожидаем профили от приложения. Прямой доступ закрыт." : "Ждём сеть. Режим VPN сохранён."; status.guardActive = guardManager.active; status.verifiedAt = nil; return
             }
-            let profile = settings.profiles[index % settings.profiles.count]
+            var profile = settings.profiles[index % settings.profiles.count]
+            // A cached UI/system DNS result can be one of our own fake IPs.
+            // Resolve hostnames afresh on each connection, outside the fake DNS.
+            if Profile.isIP(profile.endpointHost) {
+                profile.resolvedIP = try EndpointResolver.resolve(profile.endpointHost,physical:physical)
+            } else if tunnel.running, let endpoint = tunnelEndpoint, endpoint.id == profile.id, endpoint.host == profile.endpointHost {
+                profile.resolvedIP = endpoint.ip
+            } else {
+                profile.resolvedIP = nil
+                if !tunnel.running && now() >= nextCheck {
+                    do { profile = try prepareEndpoint(profile,physical:physical) }
+                    catch {
+                        status.profileID = profile.id; status.profileName = profile.name
+                        event(error.localizedDescription)
+                        connectionFailed(immediate:true)
+                        return
+                    }
+                }
+            }
+            activeProfile = profile
             if !tunnel.running { try guardManager.configureRouting(RoutingSettings(),physical:physical); try guardManager.apply(tunnel:nil,profile:profile); saveGuard() }
             try domainRoutes.configure(settings.routing,physical:physical)
             try guardManager.configureRouting(settings.routing,physical:physical)
@@ -280,12 +328,40 @@ final class Service {
             } else { connectionFailed(immediate:false) }
         } catch {
             cancelHealthProbe()
-            if settings.routing.mode == .rules { try? guardManager.configureRouting(RoutingSettings(),physical:physical); try? guardManager.apply(tunnel:tunnel.interface,profile:settings.profiles.isEmpty ? nil : settings.profiles[index % settings.profiles.count]); saveGuard() }
+            if settings.routing.mode == .rules { try? guardManager.configureRouting(RoutingSettings(),physical:physical); try? guardManager.apply(tunnel:tunnel.interface,profile:activeProfile); saveGuard() }
             status.phase = .error; status.message = error.localizedDescription; status.guardActive = guardManager.active; status.verifiedAt = nil
             nextCheck = now().addingTimeInterval(30); event(status.message)
         }
     }
     private func cancelHealthProbe() { healthProbeToken = nil }
+    private func prepareEndpoint(_ original: Profile, physical: PhysicalNetwork) throws -> Profile {
+        // Repeated profile clicks must not hammer the router's DNS. This cache
+        // contains only validated physical-DNS answers and expires after a minute;
+        // Off/Home and changes to the physical network/DNS clear it immediately.
+        if let cached = endpointCache[original.endpointHost], continuousNow() < cached.expires {
+            var profile = original; profile.resolvedIP = cached.ip
+            tunnelEndpoint = (profile.id,profile.endpointHost,cached.ip)
+            return profile
+        }
+        let servers = Array(physical.dnsServers.filter { !$0.contains(":") && !Profile.isRoutingFakeIP($0) }.prefix(3))
+        // Only the root resolver may send DNS to these physical servers. All
+        // ordinary traffic stays blocked; remove the exception on every result.
+        let resolution = Result { () throws -> String in
+            try guardManager.configureRouting(RoutingSettings(),physical:physical)
+            try guardManager.configureEndpointDNS(servers,physical:physical)
+            try guardManager.apply(tunnel:nil,profile:nil); saveGuard()
+            return try resolveEndpoint(original.endpointHost,physical)
+        }
+        try guardManager.configureEndpointDNS([],physical:physical)
+        try guardManager.apply(tunnel:nil,profile:nil); saveGuard()
+        let address = try resolution.get()
+        guard Profile.isIP(address), !address.contains(":"), !Profile.isRoutingFakeIP(address) else { throw AppError.message("DNS VPN-сервера вернул служебный или неподдерживаемый адрес") }
+        var profile = original; profile.resolvedIP = address
+        tunnelEndpoint = (profile.id,profile.endpointHost,address)
+        endpointCache[original.endpointHost] = (address,continuousNow()+60)
+        if original.resolvedIP.map(Profile.isRoutingFakeIP) == true { event("Исправлен сохранённый служебный адрес VPN-сервера") }
+        return profile
+    }
     private func probeHealth(interface: String, dns: [String]?) {
         if let health = healthCheck, asyncHealth == nil { completeHealthProbe(health(interface)); return }
         if healthProbeToken != nil {
@@ -314,6 +390,7 @@ final class Service {
         status.phase = .connected
         status.message = settings.routing.mode == .rules ? "VPN подключён · маршруты по доменам" : "VPN подключён · трафик проверен"
         status.verifiedAt = now(); failures = 0; attempted = 0; round = 0
+        settings.selectedID = status.profileID
         retryTunnelAfterBackoff = false; nextCheck = now().addingTimeInterval(30)
         if !wasConnected { event("\(status.profileName ?? "Профиль"): доступ через VPN подтверждён") }
     }

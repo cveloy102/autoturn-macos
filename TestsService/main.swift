@@ -4,14 +4,17 @@ func check(_ value:Bool,_ message:String) { guard value else { fatalError(messag
 var operations: [String] = []
 final class GuardFake: TrafficProtection {
  var token:String?; var active = false; var failRelease = false
+ var endpointDNS: [String] = [], allowedEndpoints: [String] = []
+ func configureEndpointDNS(_ servers:[String],physical:PhysicalNetwork) throws { endpointDNS = servers }
  func restoreToken(_ value:String?) { token = value }
- func apply(tunnel:String?,profile:Profile?) throws { active = true; token = "1"; operations.append("protect") }
+ func apply(tunnel:String?,profile:Profile?) throws { active = true; token = "1"; operations.append("protect"); if let ip = profile?.resolvedIP { allowedEndpoints.append(ip) } }
  func remove() throws { operations.append("release"); active = false; if failRelease { throw AppError.message("Release failure") }; token = nil }
 }
 final class TunnelFake: ManagedTunnel {
  var running = false; var interface:String?; var starts = 0
+ var startedEndpoints: [String?] = []
  func recoverJournal() {}
- func start(_ profile:Profile,physical:PhysicalNetwork,engine:String) throws { starts += 1; running = true; interface = "utun900"; operations.append("start") }
+ func start(_ profile:Profile,physical:PhysicalNetwork,engine:String) throws { starts += 1; running = true; interface = "utun900"; operations.append("start"); startedEndpoints.append(profile.resolvedIP) }
  func stop() throws { operations.append("stop"); running = false; interface = nil }
 }
 let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -263,6 +266,7 @@ func asyncConfigure(_ mode:Mode) -> RPCResponse {
  return asyncService.handle(RPCRequest(command:"configure",settings:asyncSettings,network:leaseSample("home")))
 }
 check(asyncConfigure(.on).status.phase == .connecting && asyncCompletions.count == 1,"Asynchronous health blocked initial configure")
+_ = asyncConfigure(.on)
 asyncService.tick(); asyncService.tick()
 check(asyncCompletions.count == 1,"Concurrent duplicate health probes were started")
 check(asyncConfigure(.auto).status.phase == .home && !asyncGuard.active,"Pending health probe delayed a fresh home observation")
@@ -280,6 +284,16 @@ oldCompletion(false); asyncService.queue.sync {}
 check(asyncService.status.phase == .connecting,"An obsolete configuration probe changed the new connection")
 asyncCompletions.last!(true); asyncService.queue.sync {}
 check(asyncService.status.phase == .connected && asyncGuard.active,"Current async success did not verify the protected connection")
+let manualProbeCount = asyncCompletions.count
+let manualReply = asyncService.handle(RPCRequest(command:"check",settings:nil,network:nil))
+check(manualReply.status.phase == .connecting && manualReply.status.verifiedAt == nil && asyncCompletions.count == manualProbeCount + 1,"Manual check returned a stale success before the asynchronous probe completed")
+asyncCompletions.last!(true); asyncService.queue.sync {}
+check(asyncService.status.phase == .connected && asyncService.status.verifiedAt != nil,"Manual probe result never completed the new check")
+clock += 31; asyncService.tick()
+let inFlightCount = asyncCompletions.count
+let inFlightReply = asyncService.handle(RPCRequest(command:"check",settings:nil,network:nil))
+check(inFlightReply.status.phase == .connecting && inFlightReply.status.verifiedAt == nil && asyncCompletions.count == inFlightCount,"Manual check duplicated an in-flight probe or returned a completed result prematurely")
+asyncCompletions.last!(true); asyncService.queue.sync {}
 clock += 31; asyncService.tick()
 let pendingCount = asyncCompletions.count
 for _ in 0..<6 { clock += 5; asyncService.tick() }
@@ -305,3 +319,100 @@ elapsedClock += 4; wallClock += 4; wakeService.tick()
 check(wakeService.status.phase == .connected && wakeGuard.active,"Unknown Wi-Fi after wake grace failed to require VPN")
 _ = wakeService.handle(RPCRequest(command:"stop",settings:nil,network:nil))
 print("\(passed) service checks including protected wake grace and unknown-network fallback passed")
+
+// A profile imported under fake-IP DNS used to retain 198.18.x.x forever.
+// The helper must heal that cache, scope DNS permission, and re-resolve on reconnect.
+let endpointGuard = GuardFake(), endpointTunnel = TunnelFake()
+var endpointPhysical = PhysicalNetwork(interface:"en0",gateway:"192.0.2.1",service:"endpoint-test",dnsServers:["192.0.2.53"])
+var endpointLookups = 0, failEndpointLookup = false, fakeEndpointReply = false
+let endpointService = Service(Installation(uid:501,cdhashes:[],engine:"unused"),protection:endpointGuard,managedTunnel:endpointTunnel,routing:LeaseRoutes(),physical:{endpointPhysical},health:{_ in true},stateDirectory:directory.path,monitoring:false,resolveEndpoint:{ host, physical in
+ check(host == "vpn.example" && physical.dnsServers == ["192.0.2.53"],"Endpoint lookup ignored physical DNS")
+ check(endpointGuard.active && endpointGuard.endpointDNS == ["192.0.2.53"],"Endpoint DNS query escaped the protected lookup scope")
+ endpointLookups += 1
+ if failEndpointLookup { throw AppError.message("DNS unavailable") }
+ return fakeEndpointReply ? "198.18.0.197" : endpointLookups == 1 ? "203.0.113.10" : "203.0.113.20"
+})
+var poisonedProfile = profile; poisonedProfile.endpointHost = "vpn.example"; poisonedProfile.resolvedIP = "198.18.0.197"
+var endpointSettings = Settings(); endpointSettings.mode = .on; endpointSettings.profiles = [poisonedProfile]; endpointSettings.selectedID = poisonedProfile.id
+func configureEndpoint() -> RPCResponse { endpointService.handle(RPCRequest(command:"configure",settings:endpointSettings,network:nil)) }
+check(configureEndpoint().status.phase == .connected && endpointTunnel.startedEndpoints.last! == "203.0.113.10","Cached fake endpoint was not repaired before tunnel start")
+check(endpointGuard.endpointDNS.isEmpty && !endpointGuard.allowedEndpoints.contains(where:Profile.isRoutingFakeIP),"Synthetic endpoint or temporary DNS exception remained in protection")
+endpointService.tick(); endpointService.tick()
+check(endpointLookups == 1 && endpointTunnel.starts == 1,"Healthy tunnel repeatedly resolved or restarted its endpoint")
+_ = endpointService.handle(RPCRequest(command:"stop",settings:nil,network:nil))
+check(configureEndpoint().status.phase == .connected && endpointTunnel.startedEndpoints.last! == "203.0.113.20" && endpointLookups == 2,"Reconnect reused stale endpoint instead of fresh physical DNS")
+_ = endpointService.handle(RPCRequest(command:"stop",settings:nil,network:nil)); failEndpointLookup = true; endpointSettings.routing.mode = .rules
+check(configureEndpoint().status.phase == .recovering && endpointGuard.active && endpointGuard.endpointDNS.isEmpty,"Failed endpoint DNS left the exception active or unblocked traffic")
+_ = endpointService.handle(RPCRequest(command:"stop",settings:nil,network:nil))
+failEndpointLookup = false; fakeEndpointReply = true
+check(configureEndpoint().status.phase == .recovering && endpointTunnel.starts == 2 && endpointGuard.endpointDNS.isEmpty,"Synthetic physical DNS response reached the tunnel or left DNS permission open")
+check(!endpointGuard.allowedEndpoints.contains(where:Profile.isRoutingFakeIP),"Error cleanup restored the poisoned endpoint into PF")
+_ = endpointService.handle(RPCRequest(command:"stop",settings:nil,network:nil))
+print("\(passed) service checks including fake-IP endpoint repair, physical DNS scope and fresh reconnect passed")
+
+// Primary is independent of temporary selection and a working reserve.
+let primaryGuard = GuardFake(), primaryTunnel = TunnelFake()
+var primaryPhysical = PhysicalNetwork(interface:"en0",gateway:"192.0.2.1",service:"primary")
+let primaryService = Service(Installation(uid:501,cdhashes:[],engine:"unused"),protection:primaryGuard,managedTunnel:primaryTunnel,routing:LeaseRoutes(),physical:{primaryPhysical},health:{_ in true},stateDirectory:directory.path,monitoring:false)
+var mainProfile = profile; mainProfile.id = UUID().uuidString; mainProfile.name = "Main"
+var reserveProfile = profile; reserveProfile.id = UUID().uuidString; reserveProfile.name = "Reserve"
+var primarySettings = Settings(); primarySettings.profiles = [reserveProfile,mainProfile]; primarySettings.selectedID = reserveProfile.id; primarySettings.primaryID = mainProfile.id; primarySettings.mode = .on; primarySettings.homeSSIDs = ["home"]
+func configurePrimary(_ mode:Mode, home:Bool = false) -> RPCResponse {
+ primarySettings.mode = mode
+ return primaryService.handle(RPCRequest(command:"configure",settings:primarySettings,network:NetworkObservation(available:true,interface:primaryPhysical.interface,ssid:home ? "home" : "external",gateway:primaryPhysical.gateway)))
+}
+check(configurePrimary(.on).status.profileID == mainProfile.id,"New connection did not start with explicitly chosen primary")
+check(configurePrimary(.on).status.profileID == reserveProfile.id,"Manual reserve selection was lost after a primary-first start")
+_ = configurePrimary(.off); _ = configurePrimary(.on)
+check(primaryService.handle(RPCRequest(command:"next",settings:nil,network:nil)).status.profileID == reserveProfile.id,"Reserve ordering lost primary or next profile")
+primaryService.tick(); check(primaryService.status.profileID == reserveProfile.id,"Working reserve was replaced by primary during the same cycle")
+_ = configurePrimary(.off)
+check(configurePrimary(.on).status.profileID == mainProfile.id,"Off/On cycle resumed a reserve instead of primary")
+_ = primaryService.handle(RPCRequest(command:"next",settings:nil,network:nil))
+_ = configurePrimary(.auto,home:true)
+check(configurePrimary(.on,home:true).status.profileID == mainProfile.id,"Leaving Home resumed a reserve instead of primary")
+_ = primaryService.handle(RPCRequest(command:"next",settings:nil,network:nil))
+primaryPhysical.gateway = "192.0.2.254"; primaryService.physicalNetworkChanged()
+check(primaryService.status.profileID == mainProfile.id,"Physical network change did not begin with primary")
+_ = configurePrimary(.off)
+print("\(passed) service checks including primary-first connection cycles and stable reserves passed")
+
+// DNS is scoped to the physical network and reused only during rapid switching.
+failEndpointLookup = false; fakeEndpointReply = false
+check(configureEndpoint().status.phase == .connected,"Endpoint fixture did not reconnect")
+let lookupsBeforeSwitch = endpointLookups
+var otherEndpointProfile = poisonedProfile; otherEndpointProfile.id = UUID().uuidString; otherEndpointProfile.name = "Same endpoint reserve"
+endpointSettings.profiles.append(otherEndpointProfile); endpointSettings.selectedID = otherEndpointProfile.id
+check(configureEndpoint().status.profileID == otherEndpointProfile.id && endpointLookups == lookupsBeforeSwitch,"Rapid switch needlessly resolved the same physical endpoint again")
+_ = endpointService.handle(RPCRequest(command:"stop",settings:nil,network:nil))
+check(configureEndpoint().status.phase == .connected && endpointLookups == lookupsBeforeSwitch+1,"Off failed to invalidate endpoint cache")
+
+let probeStarted = ContinuousTime.now()
+let slowProbeFinished = DispatchSemaphore(value:0)
+check(HealthProbe.firstSuccess([{ _ = slowProbeFinished.wait(timeout:.now()+3); return false },{ true }]),"Parallel health lost a successful endpoint")
+let probeElapsed = ContinuousTime.now()-probeStarted
+slowProbeFinished.signal()
+check(probeElapsed < 1,"Healthy fallback waited for a slow first endpoint")
+check(!HealthProbe.firstSuccess([{false},{false}]),"Failed health endpoints reported connected")
+check(!HealthProbe.firstSuccess([{ Thread.sleep(forTimeInterval:0.1); return true }],timeout:0.01),"Health race ignored overall deadline")
+print("\(passed) service checks including scoped endpoint reuse and first-success HTTPS scheduling passed")
+
+let beforeNetworkLookup = endpointLookups
+endpointPhysical.gateway = "192.0.2.254"
+endpointService.physicalNetworkChanged()
+check(endpointLookups == beforeNetworkLookup+1 && endpointService.status.phase == .connected,"Gateway change reused cached Endpoint from another network")
+_ = endpointService.handle(RPCRequest(command:"stop",settings:nil,network:nil))
+failEndpointLookup = true
+var literalReserve = profile; literalReserve.id = UUID().uuidString
+endpointSettings.profiles = [poisonedProfile,literalReserve]; endpointSettings.primaryID = poisonedProfile.id; endpointSettings.selectedID = poisonedProfile.id
+check(configureEndpoint().status.phase == .recovering && endpointGuard.endpointDNS.isEmpty,"Failed primary DNS did not close the temporary exception")
+endpointService.tick()
+check(endpointService.status.phase == .connected && endpointService.status.profileID == literalReserve.id,"Failed primary DNS stranded the service instead of trying a reachable reserve")
+print("\(passed) service checks including network-scoped cache invalidation and DNS-failure reserve fallback passed")
+
+let offStartupGuard = GuardFake(), offStartupTunnel = TunnelFake()
+let offStartupService = Service(Installation(uid:501,cdhashes:[],engine:"unused"),protection:offStartupGuard,managedTunnel:offStartupTunnel,routing:LeaseRoutes(),physical:{primaryPhysical},health:{_ in true},stateDirectory:directory.path,monitoring:false)
+var offStartupSettings = primarySettings; offStartupSettings.mode = .off
+let offStartupReply = offStartupService.handle(RPCRequest(command:"configure",settings:offStartupSettings,network:nil))
+check(offStartupReply.ok && offStartupReply.status.phase == .off && !offStartupGuard.active && offStartupTunnel.starts == 0,"New helper enabled VPN when restored app settings were Off")
+print("\(passed) service checks including fresh-helper configuration after an Off-mode update passed")
