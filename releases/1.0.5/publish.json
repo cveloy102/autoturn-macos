@@ -1,0 +1,11 @@
+{
+  "version": "1.0.5",
+  "build": 111,
+  "runID": 42451530312,
+  "commit": "d1448346234df9e80a7fcccce7eaf6c5e4afc2e3",
+  "sha256": "a8cd6ef1c31c9ac7c704e3132c6d0ea355d07a7d375862890cea0cebd40b3c43",
+  "archiveVerificationRunners": [
+    "macos-15",
+    "macos-15-intel"
+  ]
+}

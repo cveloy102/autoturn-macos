@@ -1,5 +1,8 @@
 # Проверка защиты DNS — 8 ноября 2026
 
+Актуальные живые результаты: [VALIDATION-1.0.5.md](VALIDATION-1.0.5.md).
+Ниже сохранён первоначальный этап проверки тестовой сборки.
+
 ## Выполнено без изменения установленной сети
 
 - `AT_TEST_ROUTING_CORE="$PWD/third_party/routing-core/sing-box" bash scripts/test.sh`: успешно.
