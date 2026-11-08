@@ -24,7 +24,7 @@ enum RoutingLiveCheck {
             do { try p.run(); p.waitUntilExit(); return p.terminationStatus == 0 } catch { return false }
         }
         func wait(_ phase: Phase) throws -> ServiceStatus {
-            for _ in 0..<20 {
+            for _ in 0..<75 {
                 let status = try request("status")
                 if status.phase == phase { return status }
                 if status.phase == .error { throw AppError.message(status.message) }
