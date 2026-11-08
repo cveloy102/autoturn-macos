@@ -21,9 +21,9 @@ final class RoutingCoreManager: DomainRouting {
     }
     func setTunnel(_ interface: String?, dns: [String], supportsIPv6: Bool) throws {
         guard settings.mode == .rules else { return }
-        guard let tunnel = interface, let physical = physical.interface, let server = dns.first else { throw AppError.message("Туннель ещё не готов для маршрутов") }
-        guard let physicalDNS = self.physical.dnsServers.first else { throw AppError.message("Не удалось определить DNS текущей сети для режима «По правилам». Попробуй «Всё через VPN».") }
-        let data = try RoutingCoreConfiguration.make(settings,physicalInterface:physical,physicalDNS:physicalDNS,tunnel:tunnel,dns:server,supportsIPv6:supportsIPv6)
+        guard let physical = physical.interface else { throw AppError.message("Нет сети для маршрутов") }
+        let tunnel = interface ?? "utun1999", server = dns.first ?? "1.1.1.1"
+        let data = try RoutingCoreConfiguration.make(settings,physicalInterface:physical,physicalDNS:"127.0.0.1",tunnel:tunnel,dns:server,supportsIPv6:supportsIPv6,vpnAvailable:interface != nil)
         let fingerprint = String(data:data,encoding:.utf8)!
         if self.fingerprint == fingerprint && process?.isRunning == true { return }
         try stopProcess()

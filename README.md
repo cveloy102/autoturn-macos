@@ -11,9 +11,9 @@
 [![Release](https://img.shields.io/github/v/release/cveloy102/autoturn-macos?color=e66c51&label=release)](https://github.com/cveloy102/autoturn-macos/releases/latest)
 [![Build](https://github.com/cveloy102/autoturn-macos/actions/workflows/ci.yml/badge.svg)](https://github.com/cveloy102/autoturn-macos/actions/workflows/ci.yml)
 
-**[Скачать для macOS](https://github.com/cveloy102/autoturn-macos/releases/latest)** · **[Сайт](https://cveloy102.github.io/autoturn-macos/)** · **[Инструкция](docs/usage.md)** · **[Что нового в 1.0.4](releases/1.0.4/notes.md)**
+**[Скачать для macOS](https://github.com/cveloy102/autoturn-macos/releases/latest)** · **[Сайт](https://cveloy102.github.io/autoturn-macos/)** · **[Инструкция](docs/usage.md)** · **[Что нового в 1.0.5](releases/1.0.5/notes.md)**
 
-**Обновление до 1.0.4 — вручную:** скачайте ZIP и замените только `AutoTurn.app` в «Программах». Старые версии не примут новый ключ обновления. Профили, домашние сети и имеющиеся правила сохраняются отдельно от приложения; данные удалять не нужно. [Подробности перехода](releases/1.0.4/notes.md).
+**Переход с 1.0.3 и более старых версий — вручную:** скачайте ZIP и замените только `AutoTurn.app` в «Программах». Старые версии не примут новый ключ обновления. Профили, домашние сети и имеющиеся правила сохраняются отдельно от приложения; данные удалять не нужно. [Подробности перехода](releases/1.0.4/notes.md).
 
 ![Пульт AutoTurn](docs/assets/connection.png)
 
@@ -39,6 +39,7 @@ AutoTurn живёт в верхнем меню macOS. Задайте домаш�
 | Каталог сервисов | Поиск, множественный выбор и обновляемые списки GeoAggregator |
 | Свои правила | IP-списки, HydraRoute, HTTPS-источники и перенос JSON |
 | Восстановление | Контроль компонентов и восстановление сети после сбоя |
+| Защита DNS | Основной и резервные DNS; зашифрованные запросы и блокировка DNS VPN-доменов при сбое |
 | Приватные профили | Хранение в Связке ключей macOS |
 | Обновления | Проверка раз в час, уведомление и установка по вашему действию |
 

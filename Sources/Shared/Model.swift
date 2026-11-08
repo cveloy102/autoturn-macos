@@ -165,13 +165,14 @@ struct Settings: Codable {
     var primaryID: String?
     var launchAtLogin: Bool = false
     var routing = RoutingSettings()
+    var dns = DNSSettings()
     init() {}
     var primaryProfileID: String? { profiles.first(where:{ $0.id == primaryID })?.id ?? profiles.first(where:{ $0.id == selectedID })?.id ?? profiles.first?.id }
     var connectionOrder: [Profile] {
         guard let primary = profiles.first(where:{ $0.id == primaryProfileID }) else { return profiles }
         return [primary] + profiles.filter { $0.id != primary.id }
     }
-    enum CodingKeys: String, CodingKey { case mode, homeSSIDs, profiles, selectedID, primaryID, launchAtLogin, routing }
+    enum CodingKeys: String, CodingKey { case mode, homeSSIDs, profiles, selectedID, primaryID, launchAtLogin, routing, dns }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy:CodingKeys.self)
         mode = try c.decodeIfPresent(Mode.self,forKey:.mode) ?? .auto
@@ -181,6 +182,7 @@ struct Settings: Codable {
         primaryID = try c.decodeIfPresent(String.self,forKey:.primaryID) ?? selectedID ?? profiles.first?.id
         launchAtLogin = try c.decodeIfPresent(Bool.self,forKey:.launchAtLogin) ?? false
         routing = try c.decodeIfPresent(RoutingSettings.self,forKey:.routing) ?? RoutingSettings()
+        dns = try c.decodeIfPresent(DNSSettings.self,forKey:.dns) ?? DNSSettings()
     }
 }
 struct NetworkObservation: Codable {
@@ -195,6 +197,8 @@ struct NetworkObservation: Codable {
 }
 struct ServiceStatus: Codable {
     var routingProtocol: Int? = 2
+    var dnsProtocol: Int? = 1
+    var dnsMessage: String? = nil
     var serviceInstance: String? = nil
     var phase: Phase = .setup
     var mode: Mode = .auto

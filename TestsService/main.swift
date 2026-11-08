@@ -83,7 +83,7 @@ check(response.ok && routing.configured == nil,"Manual off left domain routing r
 routing.rejectStart = true
 response = configure(.on,"home")
 check(!response.ok || response.status.phase == .error,"Routing core startup failure was hidden")
-check(response.status.guardActive && tunnel.running,"Routing core failure opened direct traffic")
+check(response.status.guardActive,"Routing core failure opened direct traffic")
 response = configure(.off,"home")
 check(response.status.phase == .off && !protection.active && !tunnel.running,"Off failed after routing core startup error")
 routing.rejectStart = false
@@ -327,7 +327,7 @@ var endpointPhysical = PhysicalNetwork(interface:"en0",gateway:"192.0.2.1",servi
 var endpointLookups = 0, failEndpointLookup = false, fakeEndpointReply = false
 let endpointService = Service(Installation(uid:501,cdhashes:[],engine:"unused"),protection:endpointGuard,managedTunnel:endpointTunnel,routing:LeaseRoutes(),physical:{endpointPhysical},health:{_ in true},stateDirectory:directory.path,monitoring:false,resolveEndpoint:{ host, physical in
  check(host == "vpn.example" && physical.dnsServers == ["192.0.2.53"],"Endpoint lookup ignored physical DNS")
- check(endpointGuard.active && endpointGuard.endpointDNS == ["192.0.2.53"],"Endpoint DNS query escaped the protected lookup scope")
+ check(endpointGuard.active && endpointGuard.endpointDNS == ["1.1.1.1","9.9.9.9"],"Endpoint DNS query escaped the protected lookup scope")
  endpointLookups += 1
  if failEndpointLookup { throw AppError.message("DNS unavailable") }
  return fakeEndpointReply ? "198.18.0.197" : endpointLookups == 1 ? "203.0.113.10" : "203.0.113.20"
@@ -416,3 +416,52 @@ var offStartupSettings = primarySettings; offStartupSettings.mode = .off
 let offStartupReply = offStartupService.handle(RPCRequest(command:"configure",settings:offStartupSettings,network:nil))
 check(offStartupReply.ok && offStartupReply.status.phase == .off && !offStartupGuard.active && offStartupTunnel.starts == 0,"New helper enabled VPN when restored app settings were Off")
 print("\(passed) service checks including fresh-helper configuration after an Off-mode update passed")
+
+// Exercise Service -> DNS policy across two asynchronous profile checks. No
+// upstream query may run for a protected name until the new profile is verified.
+var dnsTrace: [String] = []
+let transitionDNS = SecureDNSManager(networking:false,exchangeHTTPS:{ query,_,_,iface in
+ dnsTrace.append(iface)
+ var response = Array(query); response[2] = 0x81; response[3] = 0x80; response[6] = 0; response[7] = 1
+ response += [0xc0,12,0,1,0,1,0,0,0,30,0,4,192,0,2,42]
+ return Data(response)
+})
+let dnsGuard = GuardFake(), dnsTunnel = TunnelFake(), dnsRoutes = LeaseRoutes()
+var dnsCompletions: [(Bool) -> Void] = []
+let dnsService = Service(Installation(uid:501,cdhashes:[],engine:"unused"),protection:dnsGuard,managedTunnel:dnsTunnel,routing:dnsRoutes,physical:{leasePhysical},asyncHealth:{ _,_,done in dnsCompletions.append(done) },stateDirectory:directory.path,monitoring:false,dnsController:transitionDNS)
+var dnsSettings = Settings(); dnsSettings.mode = .on; dnsSettings.routing.mode = .rules
+var secondDNSProfile = profile; secondDNSProfile.id = UUID().uuidString
+secondDNSProfile.endpointHost = "203.0.113.30"; secondDNSProfile.resolvedIP = "203.0.113.30"
+dnsSettings.profiles = [profile,secondDNSProfile]; dnsSettings.selectedID = profile.id
+dnsSettings.routing.rules = [RoutingRule(name:"Private",domains:["private.example"])]
+func dnsQuery(_ host: String) -> Data {
+ var query = Data([0x12,0x34,1,0,0,1,0,0,0,0,0,0])
+ for label in host.split(separator:".") { query.append(UInt8(label.utf8.count)); query.append(contentsOf:label.utf8) }
+ query.append(contentsOf:[0,0,1,0,1]); return query
+}
+func protectedDNSIsBlocked() -> Bool {
+ do { _ = try transitionDNS.resolve(dnsQuery("private.example")); return false } catch { return true }
+}
+_ = dnsService.handle(RPCRequest(command:"configure",settings:dnsSettings,network:nil))
+check(protectedDNSIsBlocked() && dnsTrace.isEmpty,"Protected DNS escaped during initial VPN verification")
+_ = try transitionDNS.resolve(dnsQuery("public.example"))
+check(dnsTrace == [leasePhysical.interface!],"Ordinary DNS did not survive initial VPN verification")
+dnsCompletions[0](true); dnsService.queue.sync {}; dnsTrace = []
+_ = try transitionDNS.resolve(dnsQuery("private.example"))
+check(dnsTrace == ["utun900"],"Verified first profile did not carry protected DNS")
+_ = dnsService.handle(RPCRequest(command:"next",settings:nil,network:nil)); dnsTrace = []
+check(protectedDNSIsBlocked() && dnsTrace.isEmpty,"Protected DNS escaped between VPN profiles")
+_ = try transitionDNS.resolve(dnsQuery("public.example"))
+check(dnsTrace == [leasePhysical.interface!],"Ordinary DNS lost direct fallback between profiles")
+dnsCompletions[0](true); dnsService.queue.sync {}; dnsTrace = []
+check(protectedDNSIsBlocked() && dnsTrace.isEmpty,"An old profile's successful probe reopened protected DNS")
+dnsCompletions[1](true); dnsService.queue.sync {}
+_ = try transitionDNS.resolve(dnsQuery("private.example"))
+check(dnsService.status.profileID == secondDNSProfile.id && dnsTrace == ["utun900"],"Second verified profile did not restore protected DNS")
+_ = dnsService.handle(RPCRequest(command:"check",settings:nil,network:nil))
+dnsCompletions.last!(false); dnsService.queue.sync {}; dnsTrace = []
+check(protectedDNSIsBlocked() && dnsTrace.isEmpty,"Failed VPN health check left protected DNS enabled")
+_ = try transitionDNS.resolve(dnsQuery("public.example"))
+check(dnsTrace == [leasePhysical.interface!],"Ordinary DNS stopped after VPN health failure")
+_ = dnsService.handle(RPCRequest(command:"stop",settings:nil,network:nil))
+print("\(passed) service checks including DNS isolation during two-profile failover and stale success callbacks passed")

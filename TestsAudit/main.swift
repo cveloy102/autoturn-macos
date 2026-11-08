@@ -196,4 +196,98 @@ let deletesBeforeInvalid = routeDeletes
 check(rejects { try recoveryTunnel.stop() } && routeDeletes == deletesBeforeInvalid,"Malformed journal cannot execute a route mutation")
 
 print("Audit: \(checks) checks, \(failures) failures. No system network or Keychain changes.")
-exit(failures == 0 ? 0 : 1)
+if failures > 0 { exit(1) }
+
+// Privacy regressions exercise actual DNS packets with observable upstream
+// calls, independent of the current Wi-Fi or any installed root service.
+func privacyQuery(_ host: String, type: UInt16 = 1) -> Data {
+    var query = Data([0x12,0x34,1,0,0,1,0,0,0,0,0,0])
+    for label in host.split(separator:".") { query.append(UInt8(label.utf8.count)); query.append(contentsOf:label.utf8) }
+    query.append(contentsOf:[0,UInt8(type >> 8),UInt8(type & 255),0,1]); return query
+}
+var privacyRouting = RoutingSettings(); privacyRouting.mode = .rules
+privacyRouting.rules = [RoutingRule(name:"Protected",domains:["private.example"],ipRanges:["203.0.113.0/24"])]
+var dnsCalls: [(String,String)] = []
+var primaryDNSFails = false
+var revokeDuringQuery = false
+var privacyDNS: SecureDNSManager!
+privacyDNS = SecureDNSManager(networking:false,exchangeHTTPS:{ query,url,ip,iface in
+    dnsCalls.append((ip,iface))
+    if revokeDuringQuery { privacyDNS.setTunnel(nil) }
+    if primaryDNSFails && ip == "1.1.1.1" { throw AppError.message("Fixture provider unavailable") }
+    return endpointDNSReply(query,[192,0,2,10])
+})
+privacyDNS.configure(routing:privacyRouting,dns:DNSSettings(),physical:"en0")
+try privacyDNS.start()
+check(rejects { _ = try privacyDNS.resolve(privacyQuery("api.private.example")) },"Protected DNS escaped while VPN was unavailable")
+check(dnsCalls.isEmpty,"Protected DNS contacted a direct upstream before VPN")
+_ = try privacyDNS.resolve(privacyQuery("public.example"))
+check(dnsCalls.map { $0.1 } == ["en0"],"Ordinary DNS fallback failed to use the physical interface")
+privacyDNS.setTunnel("utun123",dns:["10.0.0.1"]); dnsCalls = []; primaryDNSFails = true
+_ = try privacyDNS.resolve(privacyQuery("api.private.example"))
+check(dnsCalls.map { $0.0 } == ["1.1.1.1","9.9.9.9"] && dnsCalls.allSatisfy { $0.1 == "utun123" },"DNS provider failover escaped the active VPN")
+privacyDNS.setTunnel(nil); dnsCalls = []
+check(rejects { _ = try privacyDNS.resolve(privacyQuery("api.private.example",type:65)) } && dnsCalls.isEmpty,"Protected HTTPS-record query escaped during profile change")
+_ = try privacyDNS.resolve(privacyQuery("public.example"))
+check(dnsCalls.allSatisfy { $0.1 == "en0" },"Direct sites lost encrypted DNS during profile change")
+privacyDNS.setTunnel("utun124"); dnsCalls = []; primaryDNSFails = false
+_ = try privacyDNS.resolve(privacyQuery("api.private.example"))
+check(dnsCalls.map { $0.1 } == ["utun124"],"Protected DNS reused the previous profile interface")
+revokeDuringQuery = true; dnsCalls = []
+check(rejects { _ = try privacyDNS.resolve(privacyQuery("revoked.private.example")) },"An old-profile DNS response survived a profile switch")
+check(dnsCalls.count == 1,"Revoked DNS request tried another upstream after profile switch")
+revokeDuringQuery = false
+privacyDNS.configure(routing:RoutingSettings(),dns:DNSSettings(),physical:"en0"); dnsCalls = []
+check(rejects { _ = try privacyDNS.resolve(privacyQuery("public.example")) } && dnsCalls.isEmpty,"Full VPN mode used direct DNS fallback")
+privacyDNS.stop()
+check(rejects { _ = try privacyDNS.resolve(privacyQuery("public.example")) },"Stopped resolver accepted a query")
+var profileOnlyDNS = DNSSettings(); profileOnlyDNS.providers = [.profile]
+check(rejects { _ = try profileOnlyDNS.validated() },"DNS settings allowed an impossible profile-only bootstrap")
+var unsafeDNS = DNSSettings(); unsafeDNS.providers = [.custom]; unsafeDNS.customURL = "http://dns.example/dns-query"; unsafeDNS.customIP = "192.0.2.1"
+check(rejects { _ = try unsafeDNS.validated() },"Unencrypted custom DNS accepted")
+unsafeDNS.customURL = "https://dns.example/dns-query"; unsafeDNS.customIP = "127.0.0.1"
+check(rejects { _ = try unsafeDNS.validated() },"Loopback custom DoH bootstrap accepted")
+let legacySettings = try JSONDecoder().decode(Settings.self,from:Data("{}".utf8))
+check(legacySettings.dns == DNSSettings(),"Old saved settings did not acquire protected DNS defaults")
+print("\(checks) audit checks including protected DNS, encrypted fallback, provider order and profile-switch revocation; failures=\(failures)")
+if failures > 0 { exit(1) }
+
+// Real UDP/TCP listener round trips on an unprivileged loopback port.
+let listenerPort = UInt16(44000 + Int(getpid()) % 16000)
+let listener = RoutingDNSProxy(listenPort:listenerPort)
+listener.resolver = { _,query,_ in endpointDNSReply(query,[192,0,2,42]) }
+try listener.start(upstream:"127.0.0.1",interface:"lo0") { _,_ in }
+do {
+    defer { listener.stop() }
+    for tcp in [false,true] {
+        let query = privacyQuery("listener.example")
+        let reply = try RoutingDNSProxy.exchange(query,upstream:"127.0.0.1",interface:"lo0",tcp:tcp,port:listenerPort)
+        check(try DNSPacket(reply).answers(matching:query).contains { $0.ip == "192.0.2.42" },"Loopback protected DNS \(tcp ? "TCP" : "UDP") round trip failed")
+    }
+}
+print("\(checks) audit checks including native UDP/TCP DNS listener; failures=\(failures)")
+if failures > 0 { exit(1) }
+
+var dnsCacheClock: TimeInterval = 1000
+var cacheUpstreamCalls = 0
+let cacheDNS = SecureDNSManager(networking:false,clock:{dnsCacheClock},exchangeHTTPS:{ query,_,_,_ in
+ cacheUpstreamCalls += 1
+ return endpointDNSReply(query,[192,0,2,42])
+})
+cacheDNS.configure(routing:privacyRouting,dns:DNSSettings(),physical:"en0");try cacheDNS.start();cacheDNS.setTunnel("utun123")
+let cacheQuery = privacyQuery("cache.private.example")
+_ = try cacheDNS.resolve(cacheQuery)
+dnsCacheClock += 7
+var secondCacheQuery = cacheQuery;secondCacheQuery[0] = 0xab;secondCacheQuery[1] = 0xcd
+let cachedReply = try cacheDNS.resolve(secondCacheQuery)
+check(cacheUpstreamCalls == 1 && cachedReply.prefix(2) == secondCacheQuery.prefix(2),"DNS cache did not reuse a reply with the caller's ID")
+check(try DNSPacket(cachedReply).answers(matching:secondCacheQuery).first?.ttl == 53,"DNS cache did not age TTLs")
+cacheDNS.setTunnel(nil)
+check(rejects { _ = try cacheDNS.resolve(cacheQuery) } && cacheUpstreamCalls == 1,"VPN cache was served to a protected name after disconnect")
+cacheDNS.setTunnel("utun124");_ = try cacheDNS.resolve(cacheQuery)
+check(cacheUpstreamCalls == 2,"New VPN profile reused the previous profile's DNS cache")
+dnsCacheClock += 61;_ = try cacheDNS.resolve(cacheQuery)
+check(cacheUpstreamCalls == 3,"Expired DNS response remained in cache")
+cacheDNS.stop()
+print("\(checks) audit checks including generation-scoped DNS cache, TTL aging and profile isolation; failures=\(failures)")
+if failures > 0 { exit(1) }

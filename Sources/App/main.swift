@@ -475,6 +475,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
         page.addArrangedSubview(heading("Настройки_"))
         page.addArrangedSubview(label(applicationVersion,size:12,color:Palette.dim))
         page.addArrangedSubview(ActionButton("Проверить разрешения и настройку…",primary:true) { [weak self] in self?.auditSetup(force:true); self?.presentSetupIfNeeded(explicit:true) })
+        dnsPreferences()
         page.addArrangedSubview(label("ОФОРМЛЕНИЕ ШТОРКИ",size:11,color:Palette.dim))
         let options = stack(vertical:false,spacing:8)
         for style in MenuAppearance.allCases {
@@ -843,7 +844,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
     func persistAndConfigure(allowRouteChanges: Bool = false) {
         do { try saveSettings(allowRouteChanges:allowRouteChanges) } catch { showError(error); return }
         buildPage()
-        guard serviceAvailable else { return }; busy = true
+        guard serviceAvailable else { return }
+        guard status.dnsProtocol == 1 else { installService(); return }; busy = true
         configurationRevision += 1
         let revision = configurationRevision
         client.send(RPCRequest(command:"configure",settings:settings,network:observer.snapshot())) { [weak self] result in
@@ -860,6 +862,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
             catch { showError(error); return }
         }
         settings.mode = mode
+        if mode != .off && serviceAvailable && status.dnsProtocol != 1 { persistAndConfigure(); return }
         buildPage(); refreshOpenMenu()
         configurationRevision += 1
         let revision = configurationRevision
@@ -913,7 +916,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
         ServiceVerification.wait(attempts:automatic ? 4 : 1,request:{ done in self.client.send(RPCRequest(command:"status",settings:nil,network:nil),completion:done) },schedule:{ retry in DispatchQueue.main.asyncAfter(deadline:.now()+0.4,execute:retry) }) { [weak self] result in
             guard let self = self else { return }
             self.busy = false; self.accept(result,quiet:true)
-            if case .success(let reply) = result, reply.ok {
+            if case .success(let reply) = result, reply.ok, reply.status.dnsProtocol == 1 {
                 self.setup.serviceMessage = ""; self.persistAndConfigure(); self.auditSetup(); return
             }
             self.beginServiceInstallation(automatic:automatic)
@@ -931,7 +934,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
             ServiceVerification.wait(request:{ done in self.client.send(RPCRequest(command:"status",settings:nil,network:nil),completion:done) },schedule:{ retry in DispatchQueue.main.asyncAfter(deadline:.now()+0.3,execute:retry) }) { result in
                 self.setup.installingService = false; self.busy = false
                 self.accept(result,quiet:true)
-                if case .success(let reply) = result, reply.ok {
+                if case .success(let reply) = result, reply.ok, reply.status.dnsProtocol == 1 {
                     self.setup.serviceMessage = ""; self.persistAndConfigure()
                 } else {
                     let detail: String
@@ -1426,6 +1429,9 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
         NSApp.terminate(nil)
     }
 }
+if CommandLine.arguments.contains("--restore-stored-settings") { exit(DNSLiveCheck.restoreStored()) }
+if CommandLine.arguments.contains("--dns-live-check-stored") { exit(DNSLiveCheck.run()) }
+
 // Explicit local route export for upgrade preservation checks; never prints or
 // exports VPN profiles, keys, SSIDs, or the rest of the Keychain record.
 if let index = CommandLine.arguments.firstIndex(of:"--export-routes"), index+1 < CommandLine.arguments.count {

@@ -104,7 +104,7 @@ extension Controller {
         state.locationRequired = true
         state.locationChecked = observer.locationAccessChecked
         state.locationGranted = observer.locationAccessChecked && !observer.locationPermissionMissing
-        state.serviceReady = serviceAvailable
+        state.serviceReady = serviceAvailable && status.dnsProtocol == 1
         state.serviceChecked = setup.serviceChecked
         state.serviceInstalling = setup.installingService
         state.serviceMessage = setup.serviceMessage

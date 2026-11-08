@@ -12,7 +12,10 @@ final class Service {
     let tunnel: ManagedTunnel
     let domainRoutes: DomainRouting
     let physicalRead: () -> PhysicalNetwork
-    let resolveEndpoint: (String, PhysicalNetwork) throws -> String
+    let resolveEndpoint: ((String, PhysicalNetwork) throws -> String)?
+    let secureDNS: SecureDNSManager
+    private var dnsTunnel: String?
+    private var currentProfile: Profile?
     private var tunnelEndpoint: (id:String, host:String, ip:String)?
     private var endpointCache: [String:(ip:String,expires:TimeInterval)] = [:]
     let healthCheck: ((String) -> Bool)?
@@ -43,8 +46,9 @@ final class Service {
     let installation: Installation
     let timer: DispatchSourceTimer
     let monitor = NWPathMonitor()
-    init(_ installation: Installation, protection: TrafficProtection = TrafficGuard(), managedTunnel: ManagedTunnel = Tunnel(), routing: DomainRouting? = nil, physical: @escaping () -> PhysicalNetwork = PhysicalNetwork.read, health: ((String) -> Bool)? = nil, asyncHealth: ((String, [String]?, @escaping (Bool) -> Void) -> Void)? = nil, stateDirectory: String = support, monitoring: Bool = true, now: @escaping () -> Date = Date.init, continuousNow: @escaping () -> TimeInterval = ContinuousTime.now, recoverProcesses: @escaping () throws -> Void = OwnedProcessRecovery.stop, resolveEndpoint: @escaping (String, PhysicalNetwork) throws -> String = { try EndpointResolver.resolve($0,physical:$1) }) {
+    init(_ installation: Installation, protection: TrafficProtection = TrafficGuard(), managedTunnel: ManagedTunnel = Tunnel(), routing: DomainRouting? = nil, physical: @escaping () -> PhysicalNetwork = PhysicalNetwork.read, health: ((String) -> Bool)? = nil, asyncHealth: ((String, [String]?, @escaping (Bool) -> Void) -> Void)? = nil, stateDirectory: String = support, monitoring: Bool = true, now: @escaping () -> Date = Date.init, continuousNow: @escaping () -> TimeInterval = ContinuousTime.now, recoverProcesses: @escaping () throws -> Void = OwnedProcessRecovery.stop, resolveEndpoint: ((String, PhysicalNetwork) throws -> String)? = nil, dnsController: SecureDNSManager? = nil) {
         self.resolveEndpoint = resolveEndpoint
+        secureDNS = dnsController ?? SecureDNSManager(networking:monitoring)
         self.now = now; self.continuousNow = continuousNow; self.asyncHealth = asyncHealth
         self.recoverProcesses = recoverProcesses
         self.installation = installation; domainRoutes = routing ?? RoutingCoreManager(protection:protection,directory:stateDirectory); guardManager = protection; tunnel = managedTunnel; physicalRead = physical; healthCheck = health; self.stateDirectory = stateDirectory
@@ -115,17 +119,18 @@ final class Service {
     func handle(_ request: RPCRequest) -> RPCResponse {
         do {
             switch request.command {
-            case "status": break
+            case "status": status.dnsMessage = secureDNS.message
             case "configure":
                 guard var value = request.settings, value.profiles.count <= 32, value.homeSSIDs.count <= 32, value.homeSSIDs.allSatisfy({ !$0.isEmpty && $0.utf8.count <= 32 }) else { throw AppError.message("Некорректные настройки") }
                 value.routing = try value.routing.validated()
+                value.dns = try value.dns.validated()
                 guard (try JSONEncoder().encode(value)).count < 900000 else { throw AppError.message("Настройки слишком большие") }
                 value.profiles = try value.profiles.map { try $0.validated() }
                 value.primaryID = value.primaryProfileID
                 value.profiles = value.connectionOrder
                 guard Set(value.profiles.map { $0.id }).count == value.profiles.count else { throw AppError.message("Повторные профили") }
                 if value.mode != .off && value.profiles.isEmpty { throw AppError.message("Сначала импортируй профиль") }
-                let changed = value.profiles != settings.profiles || value.selectedID != settings.selectedID || value.routing.mode != settings.routing.mode || (value.routing.mode == .rules && value.routing.rules != settings.routing.rules)
+                let changed = value.dns != settings.dns || value.profiles != settings.profiles || value.selectedID != settings.selectedID || value.routing.mode != settings.routing.mode || (value.routing.mode == .rules && value.routing.rules != settings.routing.rules)
                 let modeChanged = value.mode != settings.mode
                 let freshCycle = settings.mode == .off || [.home,.off,.setup].contains(status.phase)
                 let manualSelection = value.selectedID != settings.selectedID && !freshCycle
@@ -157,6 +162,7 @@ final class Service {
             case "recover":
                 cancelHealthProbe()
                 settings.mode = .off; pendingTunnelReset = false
+                secureDNS.stop(); dnsTunnel = nil
                 var errors: [String] = []
                 do { try guardManager.remove() } catch { errors.append(error.localizedDescription) }
                 do { try domainRoutes.stop() } catch { errors.append(error.localizedDescription) }
@@ -222,6 +228,7 @@ final class Service {
         status.mode = settings.mode
         let wanted = settings.mode == .off ? false : settings.profiles.isEmpty ? guardRequired : Policy.wantsVPN(mode: settings.mode, network: network, homes: settings.homeSSIDs)
         defer {
+            status.dnsMessage = secureDNS.message
             let decision = "mode=\(settings.mode.rawValue) phase=\(status.phase.rawValue) guard=\(guardManager.active) available=\(network.available) ssidKnown=\(network.ssid != nil) home=\(network.ssid.map { settings.homeSSIDs.contains($0) } ?? false) interface=\(physical.interface ?? "none") routing=\(settings.routing.mode.rawValue) physicalDNSKnown=\(!physical.dnsServers.isEmpty) dnsMatchesGateway=\(physical.dnsServers.first != nil && physical.dnsServers.first == physical.gateway)"
             if decision != lastDecision {
                 lastDecision = decision
@@ -232,6 +239,7 @@ final class Service {
         var activeProfile: Profile?
         do {
             if !wanted {
+                secureDNS.stop(); dnsTunnel = nil; status.dnsMessage = "DNS текущей сети · VPN выключен"
                 endpointCache.removeAll()
                 index = 0
                 cancelHealthProbe()
@@ -258,7 +266,10 @@ final class Service {
                 return
             }
             if let error = startupRecoveryError { throw error }
+            secureDNS.configure(routing:settings.routing,dns:settings.dns,physical:physical.interface)
+            if changed { secureDNS.setTunnel(nil); dnsTunnel = nil }
             guardRequired = true; saveGuard()
+            if !guardManager.active { try guardManager.apply(tunnel:nil,profile:nil); saveGuard() }
             if settings.mode == .auto && network.ssid == nil && continuousTime < wakeGraceUntil {
                 try guardManager.configureRouting(RoutingSettings(),physical:physical)
                 try guardManager.apply(tunnel:tunnel.running ? tunnel.interface : nil,profile:nil); saveGuard()
@@ -279,6 +290,13 @@ final class Service {
                 try guardManager.apply(tunnel: tunnel.running ? tunnel.interface : nil, profile: nil); saveGuard()
                 status.phase = .waiting; status.message = settings.profiles.isEmpty ? "Ожидаем профили от приложения. Прямой доступ закрыт." : "Ждём сеть. Режим VPN сохранён."; status.guardActive = guardManager.active; status.verifiedAt = nil; return
             }
+            try secureDNS.start()
+            if !tunnel.running || dnsTunnel == nil {
+                try domainRoutes.configure(settings.routing,physical:physical)
+                try guardManager.configureRouting(settings.routing,physical:physical)
+                try domainRoutes.setTunnel(nil,dns:[],supportsIPv6:false)
+                try guardManager.apply(tunnel:tunnel.running ? tunnel.interface : nil,profile:currentProfile); saveGuard()
+            }
             var profile = settings.profiles[index % settings.profiles.count]
             // A cached UI/system DNS result can be one of our own fake IPs.
             // Resolve hostnames afresh on each connection, outside the fake DNS.
@@ -298,8 +316,8 @@ final class Service {
                     }
                 }
             }
-            activeProfile = profile
-            if !tunnel.running { try guardManager.configureRouting(RoutingSettings(),physical:physical); try guardManager.apply(tunnel:nil,profile:profile); saveGuard() }
+            activeProfile = profile; currentProfile = profile
+            if !tunnel.running { try guardManager.apply(tunnel:nil,profile:profile); saveGuard() }
             try domainRoutes.configure(settings.routing,physical:physical)
             try guardManager.configureRouting(settings.routing,physical:physical)
             tunnel.setRoutingMode(settings.routing.mode)
@@ -309,7 +327,7 @@ final class Service {
                 // Core liveness must not wait for the VPN health/backoff timer.
                 // Keep PF active while a crashed routing process is recreated.
                 if tunnel.running {
-                    try domainRoutes.setTunnel(tunnel.interface,dns:profile.dns,supportsIPv6:profile.hasIPv6)
+                    try domainRoutes.setTunnel(dnsTunnel,dns:profile.dns,supportsIPv6:dnsTunnel != nil && profile.hasIPv6)
                     try guardManager.apply(tunnel:tunnel.interface,profile:profile)
                 }
                 status.guardActive = guardManager.active; return
@@ -320,15 +338,17 @@ final class Service {
                 do { try tunnel.start(profile, physical: physical, engine: installation.engine); try guardManager.apply(tunnel: tunnel.interface, profile: profile); saveGuard(); event("Туннель \(profile.name) создан") }
                 catch { event(error.localizedDescription); try tunnel.stop(); try guardManager.apply(tunnel: nil, profile: profile); connectionFailed(immediate: true); return }
             }
-            try domainRoutes.setTunnel(tunnel.interface,dns:profile.dns,supportsIPv6:profile.hasIPv6)
+            try domainRoutes.setTunnel(dnsTunnel,dns:profile.dns,supportsIPv6:dnsTunnel != nil && profile.hasIPv6)
             try guardManager.apply(tunnel:tunnel.interface,profile:profile)
             status.tunnel = tunnel.interface; status.guardActive = guardManager.active
             if let iface = tunnel.interface {
-                probeHealth(interface:iface,dns:settings.routing.mode == .rules ? profile.dns : nil)
+                probeHealth(interface:iface,dns:profile.dns)
             } else { connectionFailed(immediate:false) }
         } catch {
             cancelHealthProbe()
-            if settings.routing.mode == .rules { try? guardManager.configureRouting(RoutingSettings(),physical:physical); try? guardManager.apply(tunnel:tunnel.interface,profile:activeProfile); saveGuard() }
+            secureDNS.setTunnel(nil); dnsTunnel = nil
+            try? guardManager.configureRouting(RoutingSettings(),physical:physical)
+            try? guardManager.apply(tunnel:nil,profile:activeProfile); saveGuard()
             status.phase = .error; status.message = error.localizedDescription; status.guardActive = guardManager.active; status.verifiedAt = nil
             nextCheck = now().addingTimeInterval(30); event(status.message)
         }
@@ -336,21 +356,21 @@ final class Service {
     private func cancelHealthProbe() { healthProbeToken = nil }
     private func prepareEndpoint(_ original: Profile, physical: PhysicalNetwork) throws -> Profile {
         // Repeated profile clicks must not hammer the router's DNS. This cache
-        // contains only validated physical-DNS answers and expires after a minute;
+        // contains only validated encrypted-DNS answers and expires after a minute;
         // Off/Home and changes to the physical network/DNS clear it immediately.
         if let cached = endpointCache[original.endpointHost], continuousNow() < cached.expires {
             var profile = original; profile.resolvedIP = cached.ip
             tunnelEndpoint = (profile.id,profile.endpointHost,cached.ip)
             return profile
         }
-        let servers = Array(physical.dnsServers.filter { !$0.contains(":") && !Profile.isRoutingFakeIP($0) }.prefix(3))
-        // Only the root resolver may send DNS to these physical servers. All
+        let servers = settings.dns.endpoints.map { $0.ip }
+        // Only root may contact the pinned HTTPS resolvers. All
         // ordinary traffic stays blocked; remove the exception on every result.
         let resolution = Result { () throws -> String in
-            try guardManager.configureRouting(RoutingSettings(),physical:physical)
+            try guardManager.configureRouting(settings.routing,physical:physical)
             try guardManager.configureEndpointDNS(servers,physical:physical)
             try guardManager.apply(tunnel:nil,profile:nil); saveGuard()
-            return try resolveEndpoint(original.endpointHost,physical)
+            return try resolveEndpoint?(original.endpointHost,physical) ?? SecureDNSManager.endpoint(original.endpointHost,physical:physical,dns:settings.dns)
         }
         try guardManager.configureEndpointDNS([],physical:physical)
         try guardManager.apply(tunnel:nil,profile:nil); saveGuard()
@@ -382,10 +402,20 @@ final class Service {
             }
         }
         if let check = asyncHealth { check(interface,dns,completion) }
-        else { DispatchQueue.global(qos:.utility).async { completion(HealthProbe.check(tunnel:interface,dns:dns)) } }
+        else {
+            let dnsSettings = settings.dns
+            DispatchQueue.global(qos:.utility).async { completion(HealthProbe.check(tunnel:interface,dns:dns,dnsSettings:dnsSettings)) }
+        }
     }
     private func completeHealthProbe(_ healthy: Bool) {
         guard healthy else { connectionFailed(immediate:false); return }
+        do {
+            guard let interface = tunnel.interface, let profile = currentProfile, profile.id == status.profileID else { throw AppError.message("Нет активного профиля для DNS") }
+            try domainRoutes.setTunnel(interface,dns:profile.dns,supportsIPv6:profile.hasIPv6)
+            try guardManager.apply(tunnel:interface,profile:profile)
+            secureDNS.setTunnel(interface,dns:profile.dns); dnsTunnel = interface
+            status.dnsMessage = secureDNS.message
+        } catch { connectionFailed(immediate:true); return }
         let wasConnected = status.phase == .connected
         status.phase = .connected
         status.message = settings.routing.mode == .rules ? "VPN подключён · маршруты по доменам" : "VPN подключён · трафик проверен"
@@ -395,6 +425,20 @@ final class Service {
         if !wasConnected { event("\(status.profileName ?? "Профиль"): доступ через VPN подтверждён") }
     }
     private func connectionFailed(immediate: Bool) {
+        secureDNS.setTunnel(nil); dnsTunnel = nil
+        do {
+            try domainRoutes.configure(settings.routing,physical:observedPhysical)
+            try domainRoutes.setTunnel(nil,dns:[],supportsIPv6:false)
+            try guardManager.configureRouting(settings.routing,physical:observedPhysical)
+            let profile = currentProfile
+            try guardManager.apply(tunnel:tunnel.running ? tunnel.interface : nil,profile:profile)
+        } catch {
+            // If selective routing cannot be made safe, close all egress.
+            try? guardManager.configureRouting(RoutingSettings(),physical:observedPhysical)
+            try? guardManager.apply(tunnel:nil,profile:nil)
+            status.phase = .error; status.message = error.localizedDescription; status.guardActive = guardManager.active; status.verifiedAt = nil; nextCheck = now().addingTimeInterval(30); return
+        }
+        status.dnsMessage = secureDNS.message
         failures += immediate ? 3 : 1
         status.phase = .recovering; status.verifiedAt = nil; status.message = settings.routing.mode == .rules ? "VPN восстанавливается. Выбранные сервисы закрыты; прямые работают." : "Связь не подтверждена. Прямой доступ закрыт."
         status.guardActive = guardManager.active
@@ -415,8 +459,15 @@ final class Service {
         try guardManager.configureRouting(RoutingSettings(), physical: physical)
         try guardManager.apply(tunnel: nil, profile: nil)
         guardRequired = true; saveGuard()
+        secureDNS.setTunnel(nil); dnsTunnel = nil
         try domainRoutes.stop()
-        try tunnel.stop()
+        try tunnel.stop(); currentProfile = nil
+        if settings.routing.mode == .rules, physical.available {
+            try domainRoutes.configure(settings.routing,physical:physical)
+            try guardManager.configureRouting(settings.routing,physical:physical)
+            try domainRoutes.setTunnel(nil,dns:[],supportsIPv6:false)
+            try guardManager.apply(tunnel:nil,profile:nil)
+        }
     }
 }
 

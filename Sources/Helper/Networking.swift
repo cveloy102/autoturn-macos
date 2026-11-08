@@ -29,7 +29,7 @@ protocol ManagedTunnel: AnyObject {
 }
 extension ManagedTunnel { func setRoutingMode(_ mode: RoutingMode) {} }
 
-struct CommandResult { var code: Int32; var output: String }
+struct CommandResult { var code: Int32; var output: String; var data = Data() }
 enum SystemCommand {
     static func run(_ executable: String, _ arguments: [String], input: String? = nil, timeout: TimeInterval = 15, outputLimit: Int = 1024 * 1024) throws -> CommandResult {
         guard timeout.isFinite, timeout > 0, outputLimit > 0 else { throw AppError.message("Некорректные ограничения системной операции") }
@@ -82,7 +82,7 @@ enum SystemCommand {
             throw error
         }
         process.waitUntilExit()
-        return CommandResult(code: process.terminationStatus, output: String(data: data, encoding: .utf8) ?? "")
+        return CommandResult(code: process.terminationStatus, output: String(data: data, encoding: .utf8) ?? "", data:data)
     }
     static func checked(_ executable: String, _ args: [String], input: String? = nil) throws -> String {
         let result = try run(executable, args, input: input)
@@ -183,8 +183,9 @@ final class TrafficGuard: TrafficProtection {
             rules += "pass out quick \(ip.contains(":") ? "inet6" : "inet") proto udp to \(ip) port \(profile.endpointPort) keep state\n"
         }
         if let interface = endpointDNSInterface {
-            for server in endpointDNS { rules += "pass out quick on \(interface) inet proto { tcp udp } to \(server) port 53 user root keep state\n" }
+            for server in endpointDNS { rules += "pass out quick on \(interface) inet proto { tcp udp } to \(server) port 443 user root keep state\n" }
         }
+        rules += "block drop out quick proto { tcp udp } to any port { 53 853 }\n"
         if routing.mode == .rules, coreInterface != nil, let iface = physical.interface {
             // All ordinary app flows enter the routing TUN. Only the root-owned
             // core can open physical outbound sockets; it has no proxy listener.
@@ -292,7 +293,7 @@ final class Tunnel: ManagedTunnel {
         guard let store = SCDynamicStoreCreate(nil, "AutoTurnDNS" as CFString, nil, nil) else { throw AppError.message("DNS недоступен") }
         // A separate supplemental resolver, removed by key; never overwrite user DNS.
         let key = "State:/Network/Service/AutoTurn-\(primaryService)/DNS" as CFString
-        let dns: [String: Any] = ["ServerAddresses": profile.dns, "SupplementalMatchDomains": [""], "SupplementalMatchOrders": [0], "InterfaceName": iface]
+        let dns: [String: Any] = ["ServerAddresses": ["127.0.0.1"], "SupplementalMatchDomains": [""], "SupplementalMatchOrders": [0], "InterfaceName": "lo0"]
         if routingMode == .rules { return }
         dnsService = key as String
         saveJournal()
@@ -371,22 +372,32 @@ enum HealthProbe {
         }
         return state.healthy
     }
-    static func check(tunnel: String, dns: [String]? = nil) -> Bool {
+    static func check(tunnel: String, dns: [String]? = nil, dnsSettings: DNSSettings? = nil) -> Bool {
         // Curl stays bound to this utun; physical egress is blocked by PF.
         let endpoints = ["https://www.apple.com/library/test/success.html", "https://www.cloudflare.com/cdn-cgi/trace"]
-        return firstSuccess(endpoints.map { endpoint in { checkEndpoint(endpoint,tunnel:tunnel,dns:dns) } })
+        return firstSuccess(endpoints.map { endpoint in { checkEndpoint(endpoint,tunnel:tunnel,dns:dns,dnsSettings:dnsSettings) } })
     }
-    private static func checkEndpoint(_ endpoint: String, tunnel: String, dns: [String]?) -> Bool {
+    private static func checkEndpoint(_ endpoint: String, tunnel: String, dns: [String]?, dnsSettings: DNSSettings?) -> Bool {
         var extra: [String] = []
-        if let dns = dns, let server = dns.first(where: { !$0.contains(":") }), let host = URL(string:endpoint)?.host {
+        if let dns = dns, let host = URL(string:endpoint)?.host {
             let labels = host.split(separator:".")
             var query = Data([0x43,0x21,1,0,0,1,0,0,0,0,0,0]); for l in labels { query.append(UInt8(l.utf8.count)); query.append(contentsOf:l.utf8) }; query.append(contentsOf:[0,0,1,0,1])
-            guard let response = try? RoutingDNSProxy.exchange(query,upstream:server,interface:tunnel,tcp:false),
+            let response: Data?
+            if let settings = dnsSettings {
+                let resolver = SecureDNSManager(networking:false)
+                resolver.configure(routing:RoutingSettings(),dns:settings,physical:nil)
+                try? resolver.start(); resolver.setTunnel(tunnel,dns:dns)
+                response = try? resolver.resolve(query)
+                resolver.stop()
+            } else if let server = dns.first(where: { !$0.contains(":") }) {
+                response = try? RoutingDNSProxy.exchange(query,upstream:server,interface:tunnel,tcp:false)
+            } else { return false }
+            guard let response = response,
                   let records = try? DNSPacket(response).answers(matching:query),
                   let ip = records.compactMap({$0.ip}).first(where: { !$0.contains(":") && !Profile.isRoutingFakeIP($0) }) else { return false }
             extra = ["--resolve","\(host):443:\(ip)"]
         }
-        if let result = try? SystemCommand.run("/usr/bin/curl", ["--silent", "--fail", "--noproxy", "*", "--interface", tunnel, "--connect-timeout", "3", "--max-time", "5", "--max-filesize", "8192"] + extra + [endpoint],timeout:6), result.code == 0, !result.output.isEmpty { return true }
+        if let result = try? SystemCommand.run("/usr/bin/curl", ["-q", "--silent", "--fail", "--proxy", "", "--noproxy", "*", "--interface", "if!" + tunnel, "--connect-timeout", "3", "--max-time", "5", "--max-filesize", "8192"] + extra + [endpoint],timeout:6), result.code == 0, !result.output.isEmpty { return true }
         return false
     }
 }

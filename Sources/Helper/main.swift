@@ -25,6 +25,23 @@ if let index = CommandLine.arguments.firstIndex(of:"--routing-config-self-check"
         print("Routing configuration generated; no system changes"); exit(0)
     } catch { print(error.localizedDescription); exit(1) }
 }
+if CommandLine.arguments.contains("--secure-dns-self-check") {
+    do {
+        let physical = PhysicalNetwork.read()
+        let query = Data([0x12,0x34,1,0,0,1,0,0,0,0,0,0,7]+Array("example".utf8)+[3]+Array("com".utf8)+[0,0,1,0,1])
+        for provider in [DNSProvider.cloudflare,.quad9,.google] {
+            let resolver = SecureDNSManager(networking:false)
+            var routing = RoutingSettings(); routing.mode = .rules
+            var dns = DNSSettings(); dns.providers = [provider]
+            resolver.configure(routing:routing,dns:try dns.validated(),physical:physical.interface)
+            try resolver.start(); defer { resolver.stop() }
+            let response = try resolver.resolve(query)
+            guard try DNSPacket(response).answers(matching:query).contains(where: { $0.ip != nil }) else { throw AppError.message("DoH returned no address") }
+            print("PASS pinned HTTPS DNS: \(provider.title); no system resolver, routes or PF changed")
+        }
+        exit(0)
+    } catch { fputs((error.localizedDescription + "\n"),stderr); exit(1) }
+}
 if CommandLine.arguments.contains("--dns-probe-self-check") {
     do {
         let physical = PhysicalNetwork.read()
