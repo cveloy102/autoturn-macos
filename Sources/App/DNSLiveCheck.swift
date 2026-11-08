@@ -57,13 +57,32 @@ enum DNSLiveCheck {
         var saved: Settings?
         var paused: [pid_t] = []
         var watchdog: Process?
-        defer {
-            if let original = saved {
-                do { _ = try request("configure",original); _ = try waitConnected(); report("RESTORED original settings and working VPN") }
-                catch { report("RESTORE ERROR: \(error.localizedDescription)") }
-            }
+        func restore() -> Bool {
+            // Resume the ordinary observer before restoring Auto. A multi-minute
+            // diagnostic deliberately expires its home-network observation.
+            // Never manufacture a fresh SSID from that expired observation.
             for pid in paused { kill(pid,SIGCONT) }
             watchdog?.terminate()
+            guard let original = saved else { return true }
+            do {
+                if original.mode == .auto && !paused.isEmpty {
+                    let deadline = Date().addingTimeInterval(10)
+                    while Date() < deadline {
+                        if original.homeSSIDs.contains(try request("status").network) { break }
+                        Thread.sleep(forTimeInterval:0.5)
+                    }
+                }
+                _ = try request("configure",original)
+                let deadline = Date().addingTimeInterval(75)
+                repeat {
+                    let status = try request("status")
+                    let restored = original.mode == .off ? status.phase == .off : original.mode == .auto ? [.home,.connected].contains(status.phase) : status.phase == .connected
+                    if restored { report("RESTORED original settings, phase=\(status.phase.rawValue)"); return true }
+                    if status.phase == .error { throw AppError.message(status.message) }
+                    Thread.sleep(forTimeInterval:0.5)
+                } while Date() < deadline
+                throw AppError.message("Не подтверждён возврат исходного режима")
+            } catch { report("RESTORE ERROR: \(error.localizedDescription)"); return false }
         }
         do {
             let original = try Storage.load(); saved = original
@@ -126,7 +145,7 @@ enum DNSLiveCheck {
             try https("https://example.com/",expected:false)
             report("PASS full-tunnel outage: direct DNS and HTTPS blocked")
             report("LIVE DNS MATRIX PASSED; restoring original configuration")
-            return 0
-        } catch { report("LIVE DNS MATRIX FAILED: \(error.localizedDescription)"); return 1 }
+            return restore() ? 0 : 1
+        } catch { report("LIVE DNS MATRIX FAILED: \(error.localizedDescription)"); _ = restore(); return 1 }
     }
 }
