@@ -27,3 +27,6 @@ sh -n "$ROOT/Resources/install-service.sh"
 "$ROOT/.build/network-tests"
 
 "$SWIFTC" -sdk "$SDK" "$ROOT"/Sources/Shared/*.swift "$ROOT/TestsRoutingDNS/main.swift" -o "$ROOT/.build/routing-dns-fixture"
+
+"$SWIFTC" -sdk "$SDK" "$ROOT"/Sources/Shared/*.swift "$ROOT/Sources/App/RoutingDatabase.swift" "$ROOT/TestsRoutingDatabase/main.swift" -o "$ROOT/.build/routing-database-tests"
+"$ROOT/.build/routing-database-tests"

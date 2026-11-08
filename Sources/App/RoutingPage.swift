@@ -143,6 +143,7 @@ extension Controller {
                 case .success(let snapshot):
                     for i in additions.indices { if let id = additions[i].serviceID { guard let data = snapshot.services[id] else { self.info("Не получен список сервиса: " + additions[i].name); return }; additions[i].baseDomains = data.domains } }
                     self.appendRoutingRules(additions)
+                    if let warnings = snapshot.warnings { self.routingFeedback += ". Предыдущие списки сохранены: " + warnings.joined(separator:", "); if self.tab == "Маршруты" { self.buildPage() } }
                 case .failure(let error): self.routingFeedback = "Сервисы не добавлены: " + error.localizedDescription; if self.tab == "Маршруты" { self.buildPage() }
                 }
             }
@@ -196,7 +197,7 @@ extension Controller {
             case .success(let snapshot):
                 var updated = self.settings.routing
                 for index in updated.rules.indices { if let id = updated.rules[index].serviceID, let service = snapshot.services[id] { updated.rules[index].baseDomains = service.domains; updated.rules[index].baseIPRanges = nil; updated.rules[index].sourcePath = service.sourcePath } }
-                do { updated.databaseUpdatedAt = snapshot.updatedAt; self.settings.routing = try updated.validated(); self.routingFeedback = "База актуальна. Свои дополнения сохранены."; if !self.preview { self.persistAndConfigure(allowRouteChanges:true) } } catch { self.routingFeedback = "Правила сохранены без изменений: " + error.localizedDescription }
+                do { updated.databaseUpdatedAt = snapshot.updatedAt; self.settings.routing = try updated.validated(); self.routingFeedback = snapshot.warnings.map { "База обновлена. Предыдущие списки сохранены: " + $0.joined(separator:", ") } ?? "База актуальна. Свои дополнения сохранены."; if !self.preview { self.persistAndConfigure(allowRouteChanges:true) } } catch { self.routingFeedback = "Правила сохранены без изменений: " + error.localizedDescription }
             case .failure(let error): self.routingFeedback = "Не удалось обновить базу; работает предыдущая. " + error.localizedDescription
             }
             if self.tab == "Маршруты" { self.buildPage() }

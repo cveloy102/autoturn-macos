@@ -1125,6 +1125,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
         routingPicker.selected.insert("telegram"); routingPicker.search.stringValue = "chatgpt.com"; routingPicker.updateRows()
         require(routingPicker.selected.contains("telegram") && routingPicker.rows.arrangedSubviews.contains { ($0 as? NSButton)?.title.hasPrefix("Своё правило:") == true },"routing selection must survive search and offer custom domains")
         require(routingPicker.rows.arrangedSubviews.contains { ($0 as? NSButton)?.identifier?.rawValue == "openai" },"domain alias must suggest its service")
+        routingPicker.search.stringValue = "twitter.com"; routingPicker.updateRows()
+        require(routingPicker.rows.arrangedSubviews.contains { ($0 as? NSButton)?.identifier?.rawValue == "x" },"Twitter alias must offer X even before its list is downloaded")
         routingPicker.search.stringValue = ""; routingPicker.updateRows(); routingPicker.layoutSubtreeIfNeeded()
         require(routingPicker.rows.arrangedSubviews.count > 5 && routingPicker.subviews.compactMap { $0 as? NSScrollView }.first!.frame.height >= 330,"routing picker must show a tall scrollable catalog")
         let longAlert = ApplicationArtwork.alert(title:"Доступен AutoTurn 1.0.1",detail:String(repeating:"Длинное описание обновления: домены, маршруты, исправления.\n",count:400))
