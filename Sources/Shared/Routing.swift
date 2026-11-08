@@ -35,7 +35,8 @@ struct RoutingSettings: Codable, Equatable {
             guard r.allIPRanges.count <= 12000, r.allIPRanges.allSatisfy(Profile.validCIDR), r.serviceID == nil || r.sourcePath.map(RoutingPolicy.validSourcePath) == true else { throw AppError.message("Некорректный источник или IP-подсеть") }
             return r
         }
-        guard copy.rules.reduce(0, { $0 + $1.allDomains.count + $1.allIPRanges.count }) <= 12000, (try JSONEncoder().encode(copy)).count <= 700000 else { throw AppError.message("Список слишком большой: максимум 12 000 доменов и IP-подсетей") }
+        guard copy.rules.reduce(0, { $0 + $1.allDomains.count + $1.allIPRanges.count }) <= 30000 else { throw AppError.message("Список слишком большой: максимум 30 000 доменов и IP-подсетей") }
+        guard (try JSONEncoder().encode(copy)).count <= 700000 else { throw AppError.message("Список маршрутов занимает больше 700 КБ. Уменьши число записей.") }
         return copy
     }
 }

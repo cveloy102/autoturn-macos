@@ -19,13 +19,18 @@ enum Storage {
         let code = SecItemCopyMatching(query as CFDictionary, &result)
         if code == errSecItemNotFound {
             var settings = Settings()
-            if useIndependentRouting { settings.routing = try routingStore.load(fallback:settings.routing) }
+            if useIndependentRouting { settings.routing = try loadRouting(fallback:settings.routing) }
             return settings
         }
         guard code == errSecSuccess, let data = result as? Data else { throw AppError.message("Не удалось прочитать профили из Keychain") }
         var settings = try JSONDecoder().decode(Settings.self, from:data)
-        if useIndependentRouting { settings.routing = try routingStore.load(fallback:settings.routing) }
+        if useIndependentRouting { settings.routing = try loadRouting(fallback:settings.routing) }
         return settings
+    }
+    static func loadRouting(fallback: RoutingSettings) throws -> RoutingSettings {
+        let old = try routingStore.load(fallback:fallback)
+        let repaired = try RoutingDatabase.restoringMissingDomains(old,seed:RoutingDatabase.bundledSeed())
+        return repaired == old ? old : try routingStore.save(repaired,expected:old)
     }
     static func save(_ settings: Settings, expectedRouting: RoutingSettings, allowRouteChanges: Bool = false) throws -> RoutingSettings {
         // Commit routes first: a denied Keychain write must not discard a route

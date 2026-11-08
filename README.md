@@ -11,7 +11,7 @@
 [![Release](https://img.shields.io/github/v/release/cveloy102/autoturn-macos?color=e66c51&label=release)](https://github.com/cveloy102/autoturn-macos/releases/latest)
 [![Build](https://github.com/cveloy102/autoturn-macos/actions/workflows/ci.yml/badge.svg)](https://github.com/cveloy102/autoturn-macos/actions/workflows/ci.yml)
 
-**[Скачать для macOS](https://github.com/cveloy102/autoturn-macos/releases/latest)** · **[Сайт](https://cveloy102.github.io/autoturn-macos/)** · **[Инструкция](docs/usage.md)** · **[Что нового в 1.0.6](releases/1.0.6/notes.md)**
+**[Скачать для macOS](https://github.com/cveloy102/autoturn-macos/releases/latest)** · **[Сайт](https://cveloy102.github.io/autoturn-macos/)** · **[Инструкция](docs/usage.md)** · **[Что нового в 1.0.7](releases/1.0.7/notes.md)**
 
 **Переход с 1.0.3 и более старых версий — вручную:** скачайте ZIP и замените только `AutoTurn.app` в «Программах». Старые версии не примут новый ключ обновления. Профили, домашние сети и имеющиеся правила сохраняются отдельно от приложения; данные удалять не нужно. [Подробности перехода](releases/1.0.4/notes.md).
 

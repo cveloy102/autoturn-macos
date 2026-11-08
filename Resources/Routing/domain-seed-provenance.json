@@ -1,0 +1,25 @@
+{
+  "repository": "v2fly/domain-list-community",
+  "commit": "e8d7a10a15bf662c927a40a3aa680bae86379608",
+  "geoAggregatorCommit": "68c48de0d53b246a5255fbce49241328ecea2eeb",
+  "groups": {
+    "google": {
+      "fqdnSuffixes": 1083,
+      "unrepresentableRulesOmitted": 16,
+      "ipRanges": 8426
+    },
+    "github": {
+      "fqdnSuffixes": 66,
+      "unrepresentableRulesOmitted": 0
+    },
+    "discord": {
+      "fqdnSuffixes": 28,
+      "unrepresentableRulesOmitted": 0
+    },
+    "anthropic": {
+      "fqdnSuffixes": 21,
+      "unrepresentableRulesOmitted": 0,
+      "ipRanges": 3
+    }
+  }
+}

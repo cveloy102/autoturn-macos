@@ -1282,6 +1282,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
         }
         testConsoleAppearance = nil
         require(RoutingDatabase.validCatalog(routingDatabase.snapshot.catalog),"bundled route catalog invalid")
+        require(routingDatabase.snapshot.services["google"]?.domains.contains("google.com") == true,"Google domain seed missing from bundle")
+        require(routingDatabase.snapshot.services["anthropic"]?.domains.contains("claude.ai") == true,"Claude domain seed missing from bundle")
         settings.routing.mode = .rules
         settings.routing.rules = [RoutingRule(name:"YouTube",serviceID:"youtube",sourcePath:"source2/youtube.txt",baseDomains:["youtube.com","googlevideo.com","ytimg.com"]),RoutingRule(name:"Свой сервер",domains:["panel.hl100.ru"],destination:.direct)]
         for appearance in RoutingAppearance.allCases {

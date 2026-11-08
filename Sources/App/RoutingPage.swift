@@ -81,7 +81,7 @@ extension Controller {
         let card = NSView(); fill(card,color:Palette.panel); card.layer?.cornerRadius = routingAppearance == .workshop ? 2 : 7
         let detail = stack(spacing:11)
         let image = NSImageView(); image.image = NSImage(systemSymbolName:serviceSymbol(rule.serviceID),accessibilityDescription:rule.name); image.contentTintColor = Palette.red; image.translatesAutoresizingMaskIntoConstraints = false; image.widthAnchor.constraint(equalToConstant:24).isActive = true; image.heightAnchor.constraint(equalToConstant:24).isActive = true
-        detail.addArrangedSubview(stack([image,label(rule.name,size:16)],vertical:false,spacing:10)); detail.addArrangedSubview(label(rule.serviceID == nil ? "Своё правило" : "Geo-Aggregator / \(rule.allDomains.count) доменов",size:11,color:Palette.dim))
+        detail.addArrangedSubview(stack([image,label(rule.name,size:16)],vertical:false,spacing:10)); detail.addArrangedSubview(label(rule.serviceID == nil ? "Своё правило" : "База / \(rule.allDomains.count) доменов · \(rule.allIPRanges.count) IP/подсетей",size:11,color:Palette.dim))
         let modes = stack(vertical:body.bounds.width < 550,spacing:6)
         for (destination,title) in [(RouteDestination.vpn,"Через VPN"),(.direct,"Напрямую")] {
             let button = ActionButton(title,primary:rule.destination == destination) { [weak self] in guard let self = self, let index = self.settings.routing.rules.firstIndex(where: { $0.id == rule.id }) else { return }; self.settings.routing.rules[index].destination = destination; self.persistRouting() }; button.font = NSFont.monospacedSystemFont(ofSize:11,weight:.regular); modes.addArrangedSubview(button)
@@ -94,7 +94,7 @@ extension Controller {
             let text = NSTextView(); text.font = NSFont.monospacedSystemFont(ofSize:11,weight:.regular); text.backgroundColor = Palette.bg; text.textColor = Palette.ink; text.isRichText = false; text.string = (rule.domains+rule.ipRanges).joined(separator:"\n"); scroll.documentView = text; text.autoresizingMask = [.width]; text.isVerticallyResizable = true; text.textContainer?.widthTracksTextView = true; detail.addArrangedSubview(scroll)
             detail.addArrangedSubview(ActionButton("Сохранить дополнения",primary:true) { [weak self] in self?.replaceManualRules(rule,text:text.string) })
         } else {
-            detail.addArrangedSubview(label(rule.allDomains.prefix(8).joined(separator:"\n"),size:11))
+            detail.addArrangedSubview(label(rule.allDomains.isEmpty ? "Источник содержит только IP/подсети — см. ниже." : rule.allDomains.prefix(8).joined(separator:"\n"),size:11))
             if rule.allDomains.count > 8 { detail.addArrangedSubview(label("Ещё \(rule.allDomains.count-8) · весь список в редакторе",size:11,color:Palette.dim)) }
             detail.addArrangedSubview(ActionButton("Редактировать дополнения…") { [weak self] in self?.editRoutingRule(rule) })
         }
@@ -144,7 +144,7 @@ extension Controller {
                     for i in additions.indices { if let id = additions[i].serviceID { guard let data = snapshot.services[id] else { self.info("Не получен список сервиса: " + additions[i].name); return }; additions[i].baseDomains = data.domains } }
                     self.appendRoutingRules(additions)
                     if let warnings = snapshot.warnings { self.routingFeedback += ". Предыдущие списки сохранены: " + warnings.joined(separator:", "); if self.tab == "Маршруты" { self.buildPage() } }
-                case .failure(let error): self.routingFeedback = "Сервисы не добавлены: " + error.localizedDescription; if self.tab == "Маршруты" { self.buildPage() }
+                case .failure(let error): self.routingFeedback = "Сервисы не добавлены: " + error.localizedDescription; if self.tab == "Маршруты" { self.buildPage() }; self.showError(error)
                 }
             }
         } catch { showError(error) }
@@ -198,7 +198,7 @@ extension Controller {
                 var updated = self.settings.routing
                 for index in updated.rules.indices { if let id = updated.rules[index].serviceID, let service = snapshot.services[id] { updated.rules[index].baseDomains = service.domains; updated.rules[index].baseIPRanges = nil; updated.rules[index].sourcePath = service.sourcePath } }
                 do { updated.databaseUpdatedAt = snapshot.updatedAt; self.settings.routing = try updated.validated(); self.routingFeedback = snapshot.warnings.map { "База обновлена. Предыдущие списки сохранены: " + $0.joined(separator:", ") } ?? "База актуальна. Свои дополнения сохранены."; if !self.preview { self.persistAndConfigure(allowRouteChanges:true) } } catch { self.routingFeedback = "Правила сохранены без изменений: " + error.localizedDescription }
-            case .failure(let error): self.routingFeedback = "Не удалось обновить базу; работает предыдущая. " + error.localizedDescription
+            case .failure(let error): self.routingFeedback = "Не удалось обновить базу; работает предыдущая. " + error.localizedDescription; if manual { self.showError(error) }
             }
             if self.tab == "Маршруты" { self.buildPage() }
         }

@@ -1,6 +1,6 @@
 # AutoTurn: инструкция
 
-[Скачать](https://github.com/cveloy102/autoturn-macos/releases/latest) · [Главная](../README.md) · [Изменения 1.0.6](../releases/1.0.6/notes.md)
+[Скачать](https://github.com/cveloy102/autoturn-macos/releases/latest) · [Главная](../README.md) · [Изменения 1.0.7](../releases/1.0.7/notes.md)
 
 ## Первый запуск
 

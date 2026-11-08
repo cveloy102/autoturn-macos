@@ -16,15 +16,33 @@ final class RoutingDatabase {
     static let upstream = "https://raw.githubusercontent.com/Ground-Zerro/Geo-Aggregator/"
     var snapshot: RoutingDatabaseSnapshot
     let cacheURL: URL
-    init() {
-        cacheURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/AutoTurn/routing-database.json")
+    static func bundledSeed(bundle: Bundle = .main) -> [ServiceDomains] {
+        bundle.url(forResource:"seed",withExtension:"json",subdirectory:"Routing").flatMap { try? Data(contentsOf:$0) }.flatMap { try? JSONDecoder().decode(RoutingSeed.self,from:$0) }?.services ?? []
+    }
+    static func domainPart(_ values: [String]) -> [String] { values.filter { !Profile.isIP($0) && !Profile.validCIDR($0) } }
+    static func restoringMissingDomains(_ routing: RoutingSettings, seed: [ServiceDomains]) throws -> RoutingSettings {
+        var copy = routing
+        for i in copy.rules.indices {
+            guard let id = copy.rules[i].serviceID, domainPart(copy.rules[i].baseDomains).isEmpty, let service = seed.first(where: { $0.id == id }) else { continue }
+            copy.rules[i].baseDomains = Array(Set(copy.rules[i].baseDomains + domainPart(service.domains))).sorted()
+        }
+        return try copy.validated()
+    }
+    init(cacheURL: URL? = nil, bundle: Bundle = .main) {
+        self.cacheURL = cacheURL ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/AutoTurn/routing-database.json")
         let fallback = RoutingCatalog(version:1,generated:"",services:[])
-        let catalog = Bundle.main.url(forResource:"catalog",withExtension:"json",subdirectory:"Routing").flatMap { try? Data(contentsOf:$0) }.flatMap { try? JSONDecoder().decode(RoutingCatalog.self,from:$0) } ?? fallback
-        let seed = Bundle.main.url(forResource:"seed",withExtension:"json",subdirectory:"Routing").flatMap { try? Data(contentsOf:$0) }.flatMap { try? JSONDecoder().decode(RoutingSeed.self,from:$0) }
-        snapshot = RoutingDatabaseSnapshot(catalog:catalog,services:Dictionary(uniqueKeysWithValues:(seed?.services ?? []).map { ($0.id,$0) }),updatedAt:nil,commit:nil)
-        if let data = try? Data(contentsOf:cacheURL), data.count < 2000000, let saved = try? JSONDecoder().decode(RoutingDatabaseSnapshot.self,from:data), Self.validCatalog(saved.catalog), saved.services.values.allSatisfy({ RoutingPolicy.validSourcePath($0.sourcePath) && (try? RoutingPolicy.parseList($0.domains.joined(separator:"\n"))) != nil }) {
+        let catalog = bundle.url(forResource:"catalog",withExtension:"json",subdirectory:"Routing").flatMap { try? Data(contentsOf:$0) }.flatMap { try? JSONDecoder().decode(RoutingCatalog.self,from:$0) } ?? fallback
+        let seed = Self.bundledSeed(bundle:bundle)
+        snapshot = RoutingDatabaseSnapshot(catalog:catalog,services:Dictionary(uniqueKeysWithValues:seed.map { ($0.id,$0) }),updatedAt:nil,commit:nil)
+        if let data = try? Data(contentsOf:self.cacheURL), data.count < 2000000, let saved = try? JSONDecoder().decode(RoutingDatabaseSnapshot.self,from:data), Self.validCatalog(saved.catalog), saved.services.values.allSatisfy({ RoutingPolicy.validSourcePath($0.sourcePath) && (try? RoutingPolicy.parseList($0.domains.joined(separator:"\n"))) != nil }) {
             var restored = saved
             restored.catalog = (try? Self.preservingCatalog(saved.catalog,known:catalog.services)) ?? saved.catalog
+            for service in seed {
+                if var cached = restored.services[service.id] {
+                    if Self.domainPart(cached.domains).isEmpty { cached.domains = Array(Set(cached.domains + Self.domainPart(service.domains))).sorted() }
+                    restored.services[service.id] = cached
+                } else { restored.services[service.id] = service }
+            }
             snapshot = restored
         }
     }
@@ -59,7 +77,12 @@ final class RoutingDatabase {
         for id in Set(rules.compactMap { $0.serviceID }).sorted() {
             guard let service = merged.services.first(where: { $0.id == id }) else { throw AppError.message("Не найден источник сервиса: " + id) }
             do {
-                let domains = try RoutingPolicy.parseList(fetch(service.src))
+                var domains = try RoutingPolicy.parseList(fetch(service.src))
+                guard !domains.isEmpty else { throw AppError.message("Источник вернул пустой список") }
+                if domainPart(domains).isEmpty {
+                    let previous = domainPart(old.services[id]?.domains ?? []) + rules.filter { $0.serviceID == id }.flatMap { domainPart($0.baseDomains) }
+                    domains = Array(Set(domains + previous)).sorted()
+                }
                 services[id] = ServiceDomains(id:id,name:service.name,sourcePath:service.src,domains:domains)
             } catch {
                 if services[id] == nil, let saved = rules.first(where: { $0.serviceID == id }), !saved.baseDomains.isEmpty || !(saved.baseIPRanges ?? []).isEmpty {
