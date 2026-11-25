@@ -153,7 +153,15 @@ struct Settings: Codable {
         routing = try c.decodeIfPresent(RoutingSettings.self,forKey:.routing) ?? RoutingSettings()
     }
 }
-struct NetworkObservation: Codable { var available: Bool; var interface: String?; var ssid: String?; var gateway: String? }
+struct NetworkObservation: Codable {
+    var available: Bool
+    var interface: String?
+    var ssid: String?
+    var gateway: String?
+    // Optional for compatibility with older installed apps. Never renew a lease
+    // merely because an old observation finally reached the helper queue.
+    var sampledAt: Date? = nil
+}
 struct ServiceStatus: Codable {
     var routingProtocol: Int? = 2
     var phase: Phase = .setup
@@ -165,6 +173,7 @@ struct ServiceStatus: Codable {
     var guardActive: Bool = false
     var verifiedAt: Date?
     var events: [String] = []
+    var eventLogError: String?
     var tunnel: String?
 }
 struct RPCRequest: Codable { var command: String; var settings: Settings?; var network: NetworkObservation? }

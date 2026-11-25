@@ -634,6 +634,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
     func guardDescription() -> String { if !serviceAvailable { return FileManager.default.fileExists(atPath:"/Library/LaunchDaemons/ru.hl100.autoturn.helper.plist") ? "Состояние службы и блокировки не подтверждено" : "VPN-служба ещё не установлена; интернет не изменён" }; return status.guardActive && settings.routing.mode == .rules ? "Прямой доступ по правилам; выбранные сервисы защищены" : status.guardActive ? "Прямой трафик заблокирован" : "Блокировка прямого доступа выключена" }
     func selectedProfile() -> Profile? { settings.profiles.first { $0.id == settings.selectedID } ?? settings.profiles.first }
     func updateStatus() {
+        if !preview { observer.setAutomationActive(settings.mode == .auto && !settings.homeSSIDs.isEmpty && !settings.profiles.isEmpty) }
         let revision = menuRevision() + consoleAppearance.rawValue + (status.profileName ?? "") + status.events.suffix(2).joined(separator:"\n")
         guard renderedStatusRevision != revision else { return }
         renderedStatusRevision = revision
@@ -839,7 +840,26 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, UNUse
             runInstaller(script:script,app:app) { result in switch result { case .failure(let error):self.showError(error); case .success: let process = Process(); process.executableURL = URL(fileURLWithPath:"/usr/bin/open"); process.arguments = ["-n","/Applications/AutoTurn.app"]; try? process.run(); NSApp.terminate(nil) } }
         } catch { showError(error) }
     }
-    func exportDiagnostics() { let panel = NSSavePanel(); panel.nameFieldStringValue = "AutoTurn-diagnostics.txt"; guard panel.runModal() == .OK, let url = panel.url else { return }; let text = "AutoTurn \(Bundle.main.object(forInfoDictionaryKey:"CFBundleShortVersionString") ?? "0.1.0")\nAWG 3.1\nphase=\(status.phase.rawValue) mode=\(settings.mode.rawValue) guard=\(status.guardActive)\n" + status.events.joined(separator:"\n"); do { try text.write(to:url,atomically:true,encoding:.utf8) } catch { showError(error) } }
+    func exportDiagnostics() {
+        let panel = NSSavePanel(); panel.nameFieldStringValue = "AutoTurn-diagnostics.txt"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        client.send(RPCRequest(command:"status",settings:nil,network:nil)) { [weak self] result in
+            guard let self = self else { return }
+            var serviceNote = "service=available"
+            if case .success(let response) = result { self.status = response.status }
+            else { serviceNote = "service=unavailable; showing last received status" }
+            #if arch(arm64)
+            let architecture = "arm64"
+            #else
+            let architecture = "x86_64"
+            #endif
+            let network = self.observer.snapshot()
+            let home = network.ssid.map { self.settings.homeSSIDs.contains($0) } ?? false
+            let status = self.status
+            let text = "AutoTurn \(Bundle.main.object(forInfoDictionaryKey:"CFBundleShortVersionString") ?? "unknown") build=\(Bundle.main.object(forInfoDictionaryKey:"CFBundleVersion") ?? "unknown")\n\(ProcessInfo.processInfo.operatingSystemVersionString) architecture=\(architecture)\n\(ISO8601DateFormatter().string(from:Date()))\n\(serviceNote)\nphase=\(status.phase.rawValue) appMode=\(self.settings.mode.rawValue) serviceMode=\(status.mode.rawValue) guard=\(status.guardActive)\nmessage=\(status.message)\navailable=\(network.available) ssidKnown=\(network.ssid != nil) home=\(home) locationPermissionMissing=\(self.observer.locationPermissionMissing)\neventLogError=\(status.eventLogError ?? "none")\n" + status.events.joined(separator:"\n")
+            do { try text.write(to:url,atomically:true,encoding:.utf8) } catch { self.showError(error) }
+        }
+    }
     func quit() { guard confirm("Отключить VPN и завершить?",detail:"Вне дома будет разрешён прямой интернет. Закрытие одного пульта не отключает VPN.") else { return }; if serviceAvailable { busy = true; client.send(RPCRequest(command:"stop",settings:nil,network:nil)) { result in self.busy = false; switch result { case .success(let response) where response.ok: NSApp.terminate(nil); default:self.accept(result); self.info("Не удалось подтвердить остановку службы. AutoTurn остаётся открыт.") } } } else { NSApp.terminate(nil) } }
     func windowShouldClose(_ sender:NSWindow) -> Bool { sender.orderOut(nil); return false }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender:NSApplication) -> Bool { false }
